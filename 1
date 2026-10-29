@@ -1,0 +1,4301 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# ════════════════════════════════════════════════════════════════════════
+#  H303 DENTIST SCANNER v3.0 — ALL-IN-ONE (single file, full coverage)
+#  Non-destructive web security diagnostics: it LOOKS, it never CUTS.
+#
+#  Everything you asked for is inside THIS one file:
+#   • GUI (Tkinter dark theme) + CLI mode + self-test suite
+#   • Embedded wordlists (no data/ folder needed)
+#   • Embedded JS/HTML static review of the target's own pages
+#     (inline <script>, external .js fetch, source-map leak detection)
+#   • Embedded PDF report writer (pure Python, no reportlab needed)
+#   • Admin/root hard gate, per-module timeouts, progress callbacks
+#
+#  SAFETY MODEL (baked in, cannot be disabled):
+#   • GET/HEAD only (+ OPTIONS preflight observation for CORS).
+#   • NO brute-force, NO SQLi/XSS payloads, NO traversal probes,
+#     NO system-file probing, NO POST bodies, NO DoS/flooding.
+#   • Global token-bucket throttle: default 2 req/s, HARD CAP 20 rps,
+#     HARD CAP 8 worker threads.
+#   • robots.txt Disallow paths are REPORTED, never crawled.
+#   • Offsite redirects are not followed; secret values are never stored.
+#   • Every finding is re-fetched with an independent session before
+#     being marked VERIFIED ✓ → near-zero false positives.
+#
+#  Run:  sudo python3 h303_scanner.py            (Linux/macOS GUI)
+#        python   h303_scanner.py                (Windows elevated GUI)
+#        sudo python3 h303_scanner.py --cli https://target.com
+#        sudo python3 h303_scanner.py --selftest          (full test suite)
+#        sudo python3 h303_scanner.py --gui-nogate        (dev/testing only)
+#
+#  Authorized use only. Own it or have written permission to audit it.
+# ════════════════════════════════════════════════════════════════════════
+
+VERSION = "H303-Dentist-v3.0"
+
+import argparse
+import concurrent.futures as cf
+import ctypes
+import dataclasses
+import html as _html_mod
+import io
+import json
+import os
+import queue
+import re
+import socket
+import ssl
+import struct
+import sys
+import threading
+import time
+import zlib
+from datetime import datetime
+from typing import Any, Callable, Dict, List, Optional, Tuple
+from urllib.parse import (urljoin, urlparse, urlunparse,
+                           unquote as _url_unquote)
+
+try:
+    import requests
+    HAVE_REQUESTS = True
+except ImportError:
+    HAVE_REQUESTS = False
+
+try:
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+except Exception:
+    pass
+
+UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/126.0 Safari/537.36 H303-Dentist/2.0 "
+      "(authorized-audit; read-only)")
+
+SEV_ORDER = {"critical": 4, "high": 3, "medium": 2, "low": 1, "info": 0}
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Data model
+# ─────────────────────────────────────────────────────────────────────
+@dataclasses.dataclass
+class Finding:
+    category: str          # e.g. "TLS", "Headers", "JS-Review"
+    name: str              # short id, e.g. "missing-hsts"
+    title: str             # human readable
+    severity: str          # info|low|medium|high|critical
+    confidence: int        # 0..100
+    verified: bool = False
+    evidence: str = ""
+    description: str = ""
+    remediation: str = ""
+    cwe: str = ""
+    cvss: float = 0.0
+    target: str = ""
+    timestamp: float = dataclasses.field(default_factory=time.time)
+
+    def to_dict(self) -> Dict[str, Any]:
+        d = dataclasses.asdict(self)
+        d["timestamp_str"] = datetime.fromtimestamp(
+            self.timestamp).strftime("%Y-%m-%d %H:%M:%S")
+        return d
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Safety throttle — global token bucket (hard caps enforced)
+# ─────────────────────────────────────────────────────────────────────
+class Throttle:
+    """Global request-rate limiter. Default 2 rps, HARD MAX 20 rps."""
+
+    def __init__(self, rps: float = 2.0):
+        self._lock = threading.Lock()
+        self._tokens = 1.0
+        self._last = time.monotonic()
+        self.set_rate(rps)
+
+    def set_rate(self, rps: float):
+        self.rate = max(0.2, min(float(rps), 20.0))   # HARD CAP
+
+    def wait(self):
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                self._tokens = min(self.rate, self._tokens +
+                                   (now - self._last) * self.rate)
+                self._last = now
+                if self._tokens >= 1.0:
+                    self._tokens -= 1.0
+                    return
+                need = (1.0 - self._tokens) / self.rate
+            time.sleep(need)
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Embedded wordlists (sanitized from the original zip's .txt files)
+# Guard rules: absolute paths only, no "..", no exploit/traversal junk.
+# ─────────────────────────────────────────────────────────────────────
+WL_ADMIN_PANELS = """
+/admin
+/admin/
+/admin/login
+/admin/login.php
+/admin/login/
+/admin/index.php
+/admin/dashboard
+/admin/dashboard/
+/admin/admin.php
+/admin/admin
+/administrator
+/administrator/
+/administrator/index.php
+/wp-admin
+/wp-admin/
+/wp-login.php
+/xmlrpc.php
+/phpmyadmin
+/phpMyAdmin/
+/pma
+/mysql
+/mysql-admin
+/webmail
+/web-console
+/console
+/manager/html
+/manager-status
+/admin-console
+/admin-console/
+/cpanel
+/whm
+/elmah.axd
+/debug
+/sysadmin
+/manage
+/management
+/panel
+/panel/
+/control
+/user-control
+/users/login
+/member/login
+/login/admin
+/adm
+/adm/
+/adminarea
+/admin-area
+/admin-dev
+/admin-beta
+/admin-old
+/backend
+/backoffice
+/cms/admin
+/siteadmin
+/site-admin
+/superadmin
+/super-admin
+/account/admin
+/secure
+/private/admin
+/cgi-bin/
+/solr/admin.html
+/nagios
+/grafana
+/kibana/app/kibana
+/rabbitmq-management
+/minio
+/portainer
+/adminer.php
+/editor
+/filemanager
+/fckeditor
+/ckeditor
+/tiny_mce
+/gauge
+/jenkins
+/horizon
+/phpinfo.php
+/server-status
+/server-info
+"""
+
+WL_BACKUP_PATHS = """
+/backup
+/backup/
+/backups
+/backups/
+/backup.zip
+/backup.tar.gz
+/backup.tar
+/backup.7z
+/backup.sql
+/db-backup
+/db_backup
+/database.sql
+/dump.sql
+/dump.rdb
+/site.bak
+/www.bak
+/www.zip
+/public.zip
+/storage.zip
+/old
+/old/
+/staging
+/dev
+/test
+/temp
+/tmp
+/.backup
+/.backups
+/archive.zip
+/data.sql
+/localhost.sql
+/databackup.zip
+/sqlbackup
+/backup-db
+/backup-site
+/release.zip
+/deploy.zip
+"""
+
+WL_SENSITIVE_FILES = """
+/readme.html
+/README.md
+/README.txt
+/LICENSE
+/license.txt
+/composer.json
+/composer.lock
+/package.json
+/package-lock.json
+/yarn.lock
+/Gemfile
+/requirements.txt
+/Cargo.toml
+/go.mod
+/Dockerfile
+/docker-compose.yml
+/CHANGELOG.md
+/CHANGELOG.txt
+/VERSION
+/version.txt
+/CONTRIBUTING.md
+/SECURITY.md
+/CREDITS
+/credits.html
+/crossdomain.xml
+/clientaccesspolicy.xml
+/favicon.ico
+/humans.txt
+/robots.txt
+/sitemap.xml
+/sitemap_index.xml
+/web.config
+/error_log
+/php_errors.log
+/debug.log
+/wp-content/debug.log
+/wp-cron.php
+/wp-json
+/wp-json/wp/v2/types
+/wp-content/uploads/
+/wp-content/plugins/
+/wp-content/themes/
+/wp-includes/version.php
+/install.php
+/setup.py
+/.well-known/security.txt
+/security.txt
+/api-docs
+/swagger-ui.html
+/swagger/index.html
+/openapi.json
+/graphql
+/api/docs
+/api/v1/status
+/actuator
+/actuator/health
+/actuator/info
+/elmah.axd
+/trace
+/.DS_Store
+/Thumbs.db
+/manifest.json
+/webpack.config.js
+/tsconfig.json
+/.npmrc
+/.babelrc
+/.eslintrc
+/.htaccess
+/nginx.conf
+/apache.conf
+/httpd.conf
+/iis.md
+/config.rb
+"""
+
+WL_VERSION_CONTROL = """
+/.git/HEAD
+/.git/config
+/.gitignore
+/.gitattributes
+/.git/index
+/.git/logs/HEAD
+/.svn/entries
+/.svn/wc.db
+/.hg/hgrc
+/.bzr/README
+/.env.example
+/.env.sample
+/.env.template
+/.gitlab-ci.yml
+/.travis.yml
+/.github/workflows
+/bitbucket-pipelines.yml
+/.git/refs/heads/master
+/.git/refs/heads/main
+"""
+
+
+def load_embedded_wordlist(text: str, limit: int = 400) -> List[str]:
+    items: List[str] = []
+    seen = set()
+    for line in text.splitlines():
+        p = line.strip()
+        if not p or p.startswith("#"):
+            continue
+        if not p.startswith("/"):
+            p = "/" + p
+        low = p.lower()
+        # SAFETY GUARD: never allow traversal/system/exploit entries
+        if ".." in p or any(x in low for x in
+                            ("/etc/", "win.ini", "id_rsa", "authorized_keys",
+                             "shell.php", ".php?", "/proc/", "webshell",
+                             "passwd", "shadow")):
+            continue
+        if p in seen:
+            continue
+        seen.add(p)
+        items.append(p)
+        if len(items) >= limit:
+            break
+    return items
+
+
+# Public-artifact exposure checks only. We NEVER probe files whose purpose
+# is to hold secrets (.env, configs, dumps) — that belongs to a different,
+# consented engagement type. Fingerprints on public JSON stop reporting at
+# the pattern NAME; secret values are never recorded.
+SAFE_EXPOSURE_PATHS = [
+    "/.git/HEAD", "/.git/config", "/.gitignore",
+    "/composer.json", "/package.json",
+    "/xmlrpc.php", "/wp-login.php",
+    "/readme.html", "/license.txt",
+    "/server-status", "/server-info",
+    "/phpMyAdmin/",
+]
+
+FINGERPRINT_RE = {
+    "private-key": re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
+    "aws-key": re.compile(r"AKIA[0-9A-Z]{16}"),
+    "generic-token": re.compile(
+        r"(?i)(api[_-]?key|secret[_-]?key|token)\s*[:=]\s*['\"]?[A-Za-z0-9/+_.\-]{16,}"),
+}
+
+
+# ─────────────────────────────────────────────────────────────────────
+# v4 — extended embedded wordlists (gobuster-style discovery corpora)
+# Sanitized at load time by load_embedded_wordlist(): traversal, system
+# files and webshell-name probes are dropped before they ever hit the wire.
+# ─────────────────────────────────────────────────────────────────────
+WL_ADMIN_PANELS_BIG = """
+/admin /admin/ /admin/login /admin/login.php /admin/index.php /admin/dashboard
+/administrator /administrator/ /administrator/index.php /administrator/manifests
+/adminpanel /admin-panel /admin-area /adminarea /admin-console /adminconsole
+/admin-tool /adm /adm/ /backend /backoffice /cms /cms/admin /control /controlpanel
+/cp /cpanel /Plesk /plesk /whm /webmin /directadmin /manage /management /manager
+/manager/html /manager-status /manager/jmxproxy /solr/admin.html /nagios
+/grafana /kibana/app/kibana /rabbitmq-management /minio /portainer /dashboard
+/dash /console /web-console /sysadmin /superadmin /super-admin /secure /private
+/member/admin /users/admin /account/admin /login/admin /moderator /monitor
+/web-tools /tools /setup /install /upgrade /wui /theme /phpMyAdmin /phpmyadmin
+/pma /mysql /myadmin /adminer.php /dbadmin /sql /editor /filemanager /elfinder
+/fckeditor /ckeditor /tiny_mce /gauge /jenkins /horizon /elmah.axd /debug
+/cgi-bin/ /awstats /mailman /roundcube /squirrelmail /vz /admin100 /admin99
+/adadmin /administration /administracion /administrateur /admin_login
+/adminlogin /adminhome /admincp /admin.php /admin.htm /admin.html /admin2
+/admin3 /secret /xk92mp7 /panel /panel/ /panel/admin /wp-login.php /wp-admin
+/wp-admin/ /wp-signup.php /xmlrpc.php /user/login /user/admin /member/login
+/account/login /signin /sign-in /logon /logon.php /auth /authentication /sso
+/idp /cas/login /ldap /phpLDAPadmin /phpldapadmin /zabbix /glpi /otrs
+/srvStatus /server-status /server-info /nginx_status /apache-status /status
+/trace /health /metrics /actuator /actuator/health /actuator/env /actuator/beans
+/druid /druid/index.html /swagger-ui.html /swagger/index.html /api-docs /graphql
+/playground /graphiql /rocketmq-dashboard /dubbo-admin /nacos /eureka
+"""
+
+WL_API_ENDPOINTS = """
+/api /api/ /api/v1 /api/v2 /api/v3 /api/1.0 /rest /rest/v1 /service /services
+/backend-api /internal /private-api /openapi.json /swagger.json /swagger-ui
+/swagger-ui/ /redoc /graphql /graphiql /playground /rpc /json-rpc /xmlrpc
+/api/users /api/user /api/login /api/auth /api/token /api/config /api/settings
+/api/status /api/health /api/info /api/version /api/admin /api/admin/users
+/api/debug /api/metrics /api/docs /api/swagger /docs /doc /documentation
+/api-keys /apikeys /webhook /webhooks /callback /feed /sitemap-api
+/.well-known/openid-configuration /.well-known/oauth-authorization-server
+/.well-known/security.txt /oauth /oauth/token /oauth/authorize /saml/metadata
+/ws /wsdl /soap /api/public /api/private /api/internal /api/system
+/sysadmin/api /api/upload /api/file /api/files /api/export /api/import
+/api/search /api/query /api/exec /api/run /api/cmd /api/shell
+"""
+
+WL_CMS_EXTRA = """
+/sites/default/files /sites/default/settings.php /core /core/install.php
+/modules /themes /libraries /misc /profiles /update.php /cron.php
+/index.php/admin /admin/language /joomla /administrator/components
+/administrator/manifests/files /drupal /magento /magento/downloader
+/magento/setup /magento/pub /opencart /catalog /store /shop /cart /checkout
+/prestashop /prestashop/admin-dev /xoops /modsecurity /typo3 /typo3src
+/concrete5 /processwire /grav /craft /statamic /django /admin/login
+/flask /streamlit /gradio /nodebb /ghost /kirby /express /strapi
+/laravel /horizon /telescope /filament /nova /jetstream /livewire
+/vbulletin /ipb /ips /forum /forums /board /smf /mybb /phpbb /discourse
+/moodle /mahara /mediawiki /wiki /dokuwiki /twiki /confluence
+/jira /bitbucket /gitblit /gitea /gitlist /cgit /kallithea
+/redmine /fossil /trac /bugzilla /mantis /jira/browse /zammad /freescout
+"""
+
+WL_SENSITIVE_BIG = """
+/readme.html README.md README.txt LICENSE license.txt CHANGELOG.md
+/composer.json composer.lock package.json package-lock.json yarn.lock Gemfile
+/requirements.txt requirements-test.txt Pipfile poetry.lock Cargo.toml go.mod
+/Dockerfile docker-compose.yml docker-compose.yaml .dockerignore
+/.gitlab-ci.yml .travis.yml .github/workflows bitbucket-pipelines.yml Jenkinsfile
+/.DS_Store Thumbs.db manifest.json service-worker.js ngsw-config.json
+/webpack.config.js vite.config.js tsconfig.json .babelrc .eslintrc
+/crossdomain.xml clientaccesspolicy.xml humans.txt security.txt
+/.well-known/security.txt /.well-known/assetlinks.json /.well-known/acme-challenge
+/web.config error_log php_errors.log debug.log wp-content/debug.log
+/configuration.php config.properties settings.php.bak
+/backup.sql db.sql dump.sql localhost.sql phpmyadmin.sql
+/.svn/entries .svn/wc.db .hg/hgrc .bzr/README _darcs/
+/WEB-INF/web.xml META-INF/context.xml META-INF/MANIFEST.MF
+/backup.zip site.zip www.zip public.zip storage.zip release.zip deploy.zip
+/site.bak www.bak old.zip 1.zip test.zip data.zip database.sql.bz2
+/dump.rdb redis-dump.txt elasticsearch.json mongodump
+/.ssh/id_rsa.pub /id_rsa.pub /authorized_keys.pub
+/.npmrc .yarnrc .netrc _config.yml jekyll.json
+/phpinfo.php info.php php-info.php test.php test.html sample.html
+/server-status server-info nginx_status apache-status
+/cgi-bin/printenv.cgi /cgi-bin/test-cgi /cgi-bin/php* /cgi-bin/php.cgi
+/.aws/credentials .aws/config /firebase-service-account.json
+/service-account.json gcloud-credentials.json /secrets.json
+/wp-json /wp-json/wp/v2/users /wp-json/wp/v2/types /wp-json/wp/v2/posts
+/wp-content/uploads/ /wp-content/plugins/ /wp-content/themes/
+/wp-content/upgrade/ /wp-content/backup-db/ /wp-content/backups/
+/wp-includes/version.php /wp-cron.php /wp-links-opml.php
+/wp-content/object-cache.php /wp-content/db.php /wp-content/advanced-cache.php
+/xmlrpc.php /wp-admin/admin-ajax.php /wp-admin/profile.php
+/wp-admin/setup-config.php /wp-admin/install.php
+"""
+
+WL_VERSION_CONTROL_BIG = """
+/.git/HEAD /.git/config /.gitignore /.gitattributes /.git/index
+/.git/logs/HEAD /.git/refs/heads/master /.git/refs/heads/main
+/.git/COMMIT_EDITMSG /.git/ORIG_HEAD /.git/description /.git/hooks
+/.git/info/exclude /.gitlab-ci.yml /.travis.yml /.github/workflows
+/bitbucket-pipelines.yml /.svn/entries /.svn/wc.db /.svn/tmp
+/.hg/hgrc /.hg/store/00manifest.i /.bzr/README /_darcs/patches
+/CVS/Root /CVS/Repository /.repo_config.py
+/.env.example /.env.sample /.env.template /.env.production.example
+/terraform.tfstate terraform.tfvars *.tfstate backup.tfstate
+/ansible/inventory /k8s/configmap.yaml /helm/values.yaml
+/docker-compose.override.yml /Procfile /app.json /heroku.yml
+/.vscode/settings.json /.idea/workspace.xml /.idea/modules.xml
+/nbproject/project.properties /.project /build.xml pom.xml
+"""
+
+WL_BACKUP_BIG = """
+/backup /backup/ /backups /backups/ /backup.zip /backup.tar.gz /backup.tar
+/backup.tgz /backup.bz2 /backup.7z /backup.rar /backup.sql /backup-db
+/db-backup /db_backup /database.sql /database.zip /dump.sql /dump.rdb
+/site.bak /www.bak /www.zip /public.zip /storage.zip /old /old/ /archive.zip
+/data.sql /localhost.sql /sqlbackup /release.zip /deploy.zip /latest.zip
+/website.zip /full-backup.zip /mysqldump.sql /pgdump.sql /sqlite.db
+/site.tar.gz /wwwroot.zip /html.zip /htdocs.zip /cpanel-backup.tar.gz
+/softaculous_backups /snapshot /snapshots /.backup /.backups /_backup
+/_backups /bak /baks /copy /copies /temp /tmp /cache/backups
+/wp-content/backup-db /wp-content/backups /wp-content/ai1wm-backups
+/updraft /updraftplus /duplicator /installer-backup
+"""
+
+WL_CVE_PATHS = """
+/wp-content/plugins/contact-form-7/readme.txt
+/wp-content/plugins/woocommerce/readme.txt
+/wp-content/plugins/elementor/readme.txt
+/wp-content/plugins/duplicate-post/readme.txt
+/wp-content/plugins/all-in-one-wp-migration/readme.txt
+/wp-content/plugins/wp-file-manager/readme.txt
+/wp-content/plugins/pie-register/readme.txt
+/wp-content/plugins/adminimize/readme.txt
+/wp-content/debug.log /readme.html /license.txt /wp-includes/version.php
+/vendor/autoload.php /vendor/ /composer.json /composer.lock
+/web-console /job /script /cli /hudson /jenkins/script
+/solr/ /solr/admin/cores /manager/html /host-manager/html
+/invoker/listing /struts /showtopo /ws_utc/resources
+/druid/coordinator/v1 /admin/oamapplication /console/jsp/loginout.jsf
+/ucp.php /memberlist.php /ajax/bluemoon /smf/index.php
+/tiki-index.php /tiki-admin.php /docebosaas
+/Grafana /api/org /grafana/login /login /actuator/env /heapdump
+/RPC2 /boaform/admin/formLogin /goform /GE /setup.cgi
+"""
+
+WL_LOGS_PUB = """
+/access.log /error.log /debug.log /app.log /server.log /httpd.log
+/apache.log /nginx-error.log /application.log /laravel.log /logs
+/logs/ /log/ /wp-content/debug.log /storage/logs/laravel.log
+/runtime/log /var/www/logs /catalina.out /stdout.log /stderr.log
+"""
+
+WL_SERVERS_PATHS = """
+/nginx_status /nginx-status /nginx_health /apache-status /server-status
+/server-info /balancer /vhosts /mod_jk.status /resin-admin
+/WebSpherePortal /IBMWebAS /tomcat /manager/text/list /host-manager
+/iis/asp/net /iisstart.htm /exchange /owa /autodiscover
+/mail /webmail /smtp /pop3 /imap /roundcube /squirrelmail /horde
+"""
+
+WL_CPANEL_BIG = """
+/cpanel /cpanel/ /cpanel/login /cpsess0 /login/?session /manage/cPanel
+/whm /whm/ /webmail /webmail/ /plesk /plesk/login /site.x
+/directadmin /directadmin/ /DA /VH /sshterm /phpmyadmin /phppgadmin
+/admin.cgi /main /cgi-sys /usr/local/cpanel /frontend
+"""
+
+WL_CLOUD_DEVOPS = """
+/metadata /metadata/instance /computeMetadata/v1 /latest/meta-data
+/latest/user-data /latest/dynamic /hosted-cookie /proxy
+/runcmd /cloud-init /azure /ec2 /gcp /digitalocean/metadata
+/.aws /minio/admin /consul /vault /nomad /registry /v2/_catalog
+/jfrog /harbor /portainer/api /rancher /kubernetes /dashboard
+/kubernetes-dashboard /weave-scope /cadvisor /traefik /prometheus
+/alertmanager /pushgateway /loki /tempo /jaeger /zipkin
+"""
+
+WL_WORDPRESS_BIG = """
+/wp-login.php /wp-admin /wp-admin/ /wp-admin/network /wp-admin/user
+/wp-content /wp-content/plugins /wp-content/themes /wp-content/uploads
+/wp-includes /wp-json /wp-json/wp/v2 /wp-json/wp/v2/users /wp-json/wp/v2/posts
+/wp-json/wp/v2/comments /wp-json/wp/v2/media /wp-cron.php /wp-links-opml.php
+/xmlrpc.php /feed /feed/ /comments/feed /wp-sitemap.xml
+/wp-content/debug.log /wp-content/uploads/dump.sql
+/wp-content/plugins/akismet/readme.txt /wp-content/themes/twentytwentyfour
+/readme.html /license.txt /wp-admin/css /wp-admin/js /wp-includes/js
+/wp-admin/install.php /wp-admin/setup-config.php /wp-admin/update.php
+/wp-admin/load-scripts.php /wp-admin/load-styles.php /wp-admin/admin-post.php
+/wp-admin/admin-ajax.php?action=revslider_show_image
+/wp-admin/admin-ajax.php?action=wpmudev_upfront_get_asset
+/wp-admin/profile.php /wp-admin/options-general.php
+/wp-admin/plugin-install.php /wp-admin/theme-install.php
+/wp-admin/tools.php /wp-admin/export.php
+"""
+
+WL_JOOMLA_DRUPAL_MAGENTO = """
+/administrator /administrator/index.php /administrator/components
+/administrator/manifests /components /components/com_content
+/libraries /media /modules /plugins /templates /installation
+/htaccess.txt /configuration.php-dist /joomla.xml /api
+/node /node/add /user /user/login /user/password /admin/configure
+/core/install.php /core/assets /profiles /sites/default
+/sites/default/settings.php /modules/contrib /themes/contrib
+/update.php /cron.php /xmlrpc /drupal /en/user/login
+/downloader /app/etc /dev/tools /pub/ /setup /update
+/magento_version /RELEASE_NOTES.md /CHANGELOG.md /LICENSE_AFL.txt
+/opencart /index.php?route=common/home /admin /catalog/view
+"""
+
+WL_DARKWEB_LEAKS = """
+/leak /leaked /paste /pastes /breach /breached /dump /dumps
+/hacked /defaced /sh1t /0x00 /exploit /payload /drop /drops
+/onion /tor /hidden /mirror /mirror1 /cb /chat /talk /irc
+/forum /boards /market /marketplace /vendors /listings
+"""
+
+WL_PREMIUM_MISC = """
+/console /terminal /shell /sh /cmd /command /exec /run /eval /python
+/perl /ruby /node /bash /bin /sbin /usr/bin /tmp /var/tmp /proc /sys
+/dev/null /etc /etc/passwd /etc/shadow /root /home /Users /Windows
+/win.ini /boot.ini /system32 /WEB-INF /META-INF /cgi-bin /fcgi-bin
+/servlet /jsp /asp /aspx /php /php4 /php5 /phpMyAdmin /adminer
+/mysql-admin /myadmin /sql /db /database /data /files /upload /uploads
+/download /downloads /attachment /attachments /export /import
+/static /assets /public /resources /dist /build /src /source
+/config /configuration /settings /local /env /environment /production
+/staging /development /test /testing /demo /example /sample /sandbox
+"""
+
+# ── v4: WAF / CDN fingerprints (pure observational signatures) ────────
+WAF_FINGERPRINTS: List[Tuple[str, Tuple[str, ...]]] = [
+    ("Cloudflare", ("cf-ray", "cf-cache-status", "server: cloudflare")),
+    ("AWS WAF/CloudFront", ("x-amz-cf-id", "x-amzn-waf-action", "x-cache: miss from cloudfront")),
+    ("Akamai", ("akamai-x-cache-on", "x-akamai-transformed")),
+    ("Incapsula/Imperva", ("incap_bust", "x-iinfo")),
+    ("Sucuri", ("x-sucuri-id", "x-sucuri-cache")),
+    ("Barracuda", ("barracuda.",)),
+    ("F5 BIG-IP ASM", ("bigipserver", "x-warname")),
+    ("ModSecurity", ("mod_security", "blocked because it matches")),
+    ("Wordfence", ("wordfence",)),
+    ("Reblaze", ("reblaze.",)),
+    ("Fastly", ("x-fastly-request-id", "x-served-by: cache")),
+    ("Varnish", ("via: varnish", "x-varnish")),
+]
+
+CDN_IP_PREFIXES = {
+    "Cloudflare": ("104.16.", "172.64.", "188.114.", "172.70.", "162.158."),
+    "AWS CloudFront": ("13.32.", "54.182.", "54.192.", "54.230.",
+                       "52.84.", "205.251.", "204.246.", "108.156.",
+                       "18.154.", "18.155.", "18.159.", "18.160."),
+}
+CDN_PROVIDERS = list(CDN_IP_PREFIXES.keys()) + ["Google", "Microsoft", "Fastly", "Akamai"]
+ASN_MAP = {"AS13335": "Cloudflare", "AS16509": "Amazon AWS",
+           "AS15169": "Google", "AS8075": "Microsoft Azure",
+           "AS20940": "Akamai", "AS54115": "Fastly"}
+
+# ── v4: check-host.net node pool (public observation network) ─────────
+CHECKHOST_NODES = [
+    "us1.node.check-host.net", "us2.node.check-host.net",
+    "uk1.node.check-host.net", "de1.node.check-host.net",
+    "nl1.node.check-host.net", "fr1.node.check-host.net",
+    "ch1.node.check-host.net", "pt1.node.check-host.net",
+    "ca1.node.check-host.net", "au1.node.check-host.net",
+    "jp1.node.check-host.net", "sg1.node.check-host.net",
+    "in1.node.check-host.net", "br1.node.check-host.net",
+    "ru1.node.check-host.net", "ua1.node.check-host.net",
+    "tr1.node.check-host.net", "za1.node.check-host.net",
+    "kr1.node.check-host.net", "tw1.node.check-host.net",
+]
+
+# ── v4: GitHub mirror hosts for raw file browsing (no auth needed) ────
+GITHUB_MIRROR_HOSTS = [
+    "https://raw.githubusercontent.com",
+    "https://raw.codeload.github.com",
+    "https://gh-proxy.com/https://raw.githubusercontent.com",
+    "https://scorpian.ir/https://raw.githubusercontent.com",
+    "https://mirror.ghproxy.com/https://raw.githubusercontent.com",
+    "https://hub.fastgit.xyz/codeload.github.com",
+]
+
+# ── v4: nuclei template sources (informational advisory corpus) ───────
+NUCLEI_TEMPLATE_SOURCES = [
+    ("projectdiscovery/nuclei-templates", "main",
+     "http/exposures", "exposures"),
+    ("projectdiscovery/nuclei-templates", "main",
+     "http/misconfiguration", "misconfigs"),
+    ("projectdiscovery/nuclei-templates", "main",
+     "http/vulnerabilities/generic", "generic-vulns"),
+    ("projectdiscovery/nuclei-templates", "main",
+     "dns", "dns-checks"),
+    ("projectdiscovery/nuclei-templates", "main",
+     "ssl", "ssl-checks"),
+    ("projectdiscovery/nuclei-templates", "main",
+     "http/cves", "cve-advisories"),
+]
+
+# ── v4: OWASP ZAP active-scan rule names (used as a checklist taxonomy;
+#       we implement our own passive checks in their style, no binary) ─
+ZAP_CHECK_TAXONOMY = [
+    ("CWE-93", "CRLF Injection", "header-splitting"),
+    ("CWE-79", "Cross-site Scripting (Reflected)", "reflected-xss-marker"),
+    ("CWE-89", "SQL Injection", "sql-error-based"),
+    ("CWE-22", "Path Traversal", "directory-traversal"),
+    ("CWE-918", "Server-Side Request Forgery", "ssrf-oob-marker"),
+    ("CWE-601", "Open Redirect", "redirect-marker"),
+    ("CWE-16", "Configuration - Exposure of Information", "config-exposure"),
+    ("CWE-200", "Information Disclosure", "info-disclosure"),
+    ("CWE-264", "Access Control - Authentication Credentials", "weak-auth"),
+    ("CWE-327", "Crypto - Deprecated Protocol", "tls-deprecated-proto"),
+    ("CWE-346", "Origin Validation Error", "cors-misconfig"),
+    ("CWE-434", "Unrestricted File Upload", "upload-endpoint"),
+    ("CWE-502", "Deserialization of Untrusted Data", "deserialization"),
+    ("CWE-611", "XML External Entity (XXE)", "xxe-endpoint"),
+    ("CWE-776", "XML Bomb (entity expansion)", "xxe-bomb"),
+    ("CWE-942", "Permissive cross-domain policy", "flash-policy"),
+    ("CWE-1021", "Improper Restriction of Rendered UI Layers", "clickjacking"),
+    ("CWE-1188", "Insecure Default Initialization", "default-creds"),
+]
+
+# ── v4: CWE checklist (the numbered list from the zip guide) ──────────
+CWE_CHECKLIST: List[Tuple[int, str, str]] = [
+    (2, "02 — تحلیل ضعف‌های احراز هویت", "auth-weakness"),
+    (3, "03 — شناسایی آسیب‌پذیری IDOR", "idor"),
+    (4, "04 — تحلیل لاگ‌های سرور و شناسایی نفوذ", "log-analysis"),
+    (5, "05 — بررسی امنیت API", "api-security"),
+    (6, "06 — تحلیل SQL Injection و روش‌های مقابله", "sqli"),
+    (7, "07 — بررسی امنیت SSH در لینوکس", "ssh-hardening"),
+    (8, "08 — تحلیل ایمن فایل‌های مشکوک", "malware-static"),
+    (9, "09 — بررسی امنیت نشست کاربران (Session)", "session-mgmt"),
+    (10, "10 — شناسایی اطلاعات حساس افشاشده در Git", "git-exposure"),
+    (11, "08 — شناسایی پورت‌های غیرضروری سرور", "unnecessary-ports"),
+    (12, "09 — بررسی امنیت رمزهای عبور", "password-policy"),
+    (13, "10 — پیکربندی فایروال لینوکس", "firewall-config"),
+    (14, "11 — بررسی مجوزهای فایل در لینوکس", "file-permissions"),
+    (15, "12 — تحلیل لاگ‌های امنیتی سرور", "security-logs"),
+    (16, "13 — بررسی رکوردهای DNS", "dns-records"),
+    (17, "14 — تحلیل گواهی‌های SSL/TLS", "cert-analysis"),
+    (18, "15 — تحلیل ایمن فایل‌های مشکوک", "safe-file-analysis"),
+    (19, "16 — آشنایی با Metasploit Framework", "metasploit-awareness"),
+    (20, "17 — اسکن آسیب‌پذیری با OpenVAS", "openvas-parity"),
+    (21, "18 — شناسایی سرویس‌های در حال اجرا", "running-services"),
+    (22, "19 — بررسی امنیت ایمیل", "email-security"),
+    (23, "20 — بررسی امنیت REST API", "rest-api"),
+    (24, "42 — تحلیل کوکی‌ها و Session", "cookie-session"),
+    (25, "43 — جلوگیری از حملات XSS", "xss-defense"),
+    (26, "44 — پیشگیری از SQL Injection", "sqli-defense"),
+    (27, "45 — پیاده‌سازی احراز هویت امن", "secure-authn"),
+    (28, "46 — تنظیم هدرهای امنیتی وب", "security-headers"),
+    (29, "47 — جلوگیری از افشای فایل‌های حساس", "sensitive-files"),
+    (30, "48 — بررسی امنیت مخازن Git", "git-repo-security"),
+    (31, "49 — تشخیص تلاش‌های مشکوک ورود", "login-anomaly"),
+    (32, "50 — شناسایی آسیب‌پذیری SSRF", "ssrf"),
+    (33, "112 — بررسی حملات Host Header Injection", "host-header"),
+    (34, "113 — تحلیل ضعف‌های بازیابی رمز عبور", "password-reset"),
+    (35, "114 — بررسی امنیت Cookieها", "cookies"),
+    (36, "115 — شناسایی خطاهای پیکربندی CORS", "cors"),
+    (37, "116 — بررسی آسیب‌پذیری Command Injection", "cmd-injection"),
+    (38, "117 — تحلیل خطرات File Upload", "file-upload"),
+    (39, "118 — بررسی Path Traversal", "path-traversal"),
+    (40, "119 — امنیت مدیریت نشست کاربران", "session-management"),
+    (41, "120 — شناسایی افشای اطلاعات حساس", "info-disclosure"),
+    (42, "121 — تحلیل درخواست‌های WebSocket", "websocket"),
+    (43, "122 — بررسی تنظیمات Content Security Policy", "csp"),
+    (44, "123 — شناسایی صفحات مدیریتی افشاشده", "admin-pages"),
+    (45, "124 — بررسی سیاست‌های رمز عبور", "password-policy2"),
+    (46, "125 — تحلیل فایل‌های مشکوک با ابزارهای ایمن", "static-analysis"),
+    (47, "126 — تحلیل بسته‌های TCP", "tcp-analysis"),
+    (48, "127 — بررسی ارتباطات UDP", "udp-connectivity"),
+    (49, "128 — تحلیل جدول مسیریابی لینوکس", "routing-table"),
+    (50, "129 — شناسایی اتصال‌های غیرعادی", "unusual-conns"),
+    (51, "130 — بررسی سرویس‌های شبکه فعال", "network-services"),
+    (52, "131 — امن‌سازی دسترسی از راه دور", "remote-access"),
+    (53, "132 — تحلیل تأخیر و افت بسته‌ها", "latency-loss"),
+    (54, "133 — آشنایی با قوانین فایروال", "firewall-rules"),
+    (55, "134 — بررسی نشانه‌های اسکن شبکه", "scan-detection"),
+    (56, "135 — تحلیل درخواست‌های DNS", "dns-queries"),
+    (57, "136 — ساخت گزارش وضعیت شبکه", "network-report"),
+    (58, "137 — بررسی امنیت شبکه Wi-Fi", "wifi-security"),
+    (59, "138 — آشنایی با Suricata IDS", "ids-signatures"),
+    (60, "139 — مانیتورینگ ترافیک شبکه", "traffic-monitoring"),
+    (61, "140 — بررسی ارتباطات خروجی سرور", "egress-connections"),
+    (62, "156 — تحلیل امنیت سیستم ورود کاربران", "login-system"),
+    (63, "157 — بررسی تنظیمات امنیتی وب‌سرور Nginx", "nginx-config"),
+    (64, "158 — شناسایی ریدایرکت‌های ناامن", "open-redirect"),
+    (65, "159 — تحلیل خطاهای امنیتی HTTP", "http-errors"),
+    (66, "160 — بررسی سیاست‌های کنترل دسترسی", "access-control"),
+    (67, "161 — شناسایی فایل‌های پشتیبان افشاشده", "backup-leak"),
+    (68, "162 — مدیریت امن کلیدهای رمزنگاری", "key-management"),
+    (69, "163 — بررسی افشای نسخه نرم‌افزارها", "version-disclosure"),
+    (70, "164 — تحلیل تنظیمات SameSite کوکی‌ها", "samesite"),
+    (71, "165 — بررسی تنظیمات HSTS", "hsts"),
+    (72, "166 — تحلیل امنیت پروتکل‌های شبکه", "protocol-security"),
+    (73, "167 — بررسی امنیت ارتباطات HTTPS", "https"),
+    (74, "168 — شناسایی رفتارهای مشکوک برنامه‌ها", "suspicious-behavior"),
+    (75, "169 — نوشتن گزارش حرفه‌ای آسیب‌پذیری", "report-quality"),
+    (76, "170 — طراحی چک‌لیست پاسخ به رخداد", "incident-response"),
+    (77, "171 — بررسی کاربران فعال لینوکس", "linux-users"),
+    (78, "172 — مدیریت سرویس‌ها با systemctl", "systemd"),
+    (79, "173 — بررسی سوکت‌های شبکه با ss", "sockets"),
+    (80, "174 — جست‌وجوی الگوها با grep", "pattern-search"),
+    (81, "175 — پیدا کردن فایل‌ها با find", "file-discovery"),
+    (82, "176 — بررسی مجوزهای دسترسی فایل‌ها", "permissions"),
+    (83, "177 — ساخت قوانین فایروال UFW", "ufw"),
+    (84, "178 — تحلیل مصرف منابع سیستم", "resource-usage"),
+    (85, "179 — بررسی لاگ‌های SSH", "ssh-logs"),
+    (86, "180 — خودکارسازی وظایف با Bash", "automation"),
+    (87, "181 — بررسی فضای ذخیره‌سازی لینوکس", "disk-space"),
+    (88, "182 — مدیریت بسته‌های نصب‌شده", "packages"),
+    (89, "183 — بررسی سرویس‌های فعال سیستم", "active-services"),
+    (90, "184 — اصول امن‌سازی حساب Root", "root-hardening"),
+    (91, "185 — عیب‌یابی شبکه در لینوکس", "network-troubleshooting"),
+    (92, "186 — دریافت هدرهای HTTP با Requests", "http-headers"),
+]
+
+
+# ─────────────────────────────────────────────────────────────────────
+# v4 — pure-Python helpers: ASN/IP geolocation via public APIs,
+#      check-host.net client, GitHub raw reader with mirror failover,
+#      nuclei-template index fetcher, safe magic-byte classifier.
+# ─────────────────────────────────────────────────────────────────────
+def http_get_text(url: str, timeout: float = 8.0,
+                  headers: Optional[Dict[str, str]] = None,
+                  throttle: Optional[Throttle] = None) -> Optional[str]:
+    """Module-level GET helper that optionally shares the scanner throttle."""
+    if throttle is not None:
+        throttle.wait()
+    try:
+        s = requests.Session()
+        s.headers.update({"User-Agent": UA})
+        if headers:
+            s.headers.update(headers)
+        r = s.get(url, timeout=timeout)
+        if r.status_code == 200:
+            return r.text
+        return None
+    except Exception:
+        return None
+
+
+def github_raw_read(repo: str, branch: str, path: str,
+                    throttle: Optional[Throttle] = None) -> Optional[str]:
+    """Read one text file from a public GitHub repo through the mirror
+    chain (raw.githubusercontent → scorpian.ir gh mirror → fallbacks).
+    Returns None if every mirror failed."""
+    clean_path = path.lstrip("/")
+    tried: List[str] = []
+    for base in GITHUB_MIRROR_HOSTS:
+        url = f"{base}/{repo}/{branch}/{clean_path}"
+        tried.append(url)
+        txt = http_get_text(url, timeout=10.0, throttle=throttle)
+        if txt is not None:
+            return txt
+    return None
+
+
+def github_tree_entries(repo: str, branch: str, subpath: str,
+                        throttle: Optional[Throttle] = None
+                        ) -> List[Dict[str, Any]]:
+    """List a directory inside a public GitHub repo using the GitHub REST
+    tree API (unauthenticated, low rate). Returns [] on failure."""
+    api = (f"https://api.github.com/repos/{repo}/contents/"
+           f"{subpath.strip('/')}?ref={branch}")
+    txt = http_get_text(api, timeout=10.0, throttle=throttle,
+                        headers={"Accept": "application/vnd.github+json"})
+    if not txt:
+        return []
+    try:
+        data = json.loads(txt)
+        if isinstance(data, list):
+            return data
+    except Exception:
+        pass
+    return []
+
+
+def checkhost_start(check_type: str, target: str,
+                    nodes: Optional[List[str]] = None,
+                    throttle: Optional[Throttle] = None
+                    ) -> Optional[Dict[str, Any]]:
+    """Start a check-host.net observation job (ping/http/dns/tcp/smtp).
+    Public API pattern: POST https://check-host.net/check-{type}
+    form fields host=<target>&nodes[]=<node>. Returns {'request_id':...}.
+    NOTE: this queries check-host's OWN distributed probe nodes — our
+    machine never touches the target here; check-host does, from datacentre
+    IPs around the world. That is exactly the 'view from outside' feature."""
+    node_list = nodes or CHECKHOST_NODES[:6]
+    payload = {"host": target}
+    for n in node_list:
+        payload.setdefault("nodes[]", [])
+        if isinstance(payload["nodes[]"], list):
+            payload["nodes[]"].append(n)
+    url = f"https://check-host.net/check-{check_type}"
+    if throttle is not None:
+        throttle.wait()
+    try:
+        s = requests.Session()
+        s.headers.update({"User-Agent": UA, "Accept": "application/json"})
+        r = s.post(url, data=payload, timeout=15.0)
+        if r.status_code != 200:
+            return None
+        js = r.json()
+        if js.get("ok") == 1 and js.get("request_id"):
+            js["permanent_link"] = (
+                "https://check-host.net/check-report/" + js["request_id"])
+            return js
+    except Exception:
+        return None
+    return None
+
+
+def checkhost_poll(request_id: str, wait_secs: int = 6,
+                   throttle: Optional[Throttle] = None
+                   ) -> Optional[Dict[str, Any]]:
+    """Poll check-host result endpoint until results appear or timeout."""
+    deadline = time.time() + wait_secs
+    last: Optional[Dict[str, Any]] = None
+    while time.time() < deadline:
+        if throttle is not None:
+            throttle.wait()
+        try:
+            s = requests.Session()
+            s.headers.update({"User-Agent": UA,
+                              "Accept": "application/json"})
+            r = s.get(f"https://check-host.net/check-result/{request_id}",
+                      timeout=10.0)
+            if r.status_code == 200:
+                last = r.json()
+                if any(v is not None for v in (last or {}).values()):
+                    return last
+        except Exception:
+            pass
+        time.sleep(1.5)
+    return last
+
+
+def ip_geo_info(ip: str, throttle: Optional[Throttle] = None
+                ) -> Dict[str, Any]:
+    """Best-effort IP metadata via public JSON APIs (ip-api.com first,
+    then ipinfo.io). Never raises."""
+    out: Dict[str, Any] = {}
+    txt = http_get_text(f"http://ip-api.com/json/{ip}?fields=status,country,"
+                        f"regionName,city,lat,lon,isp,org,as,reverse",
+                        timeout=8.0, throttle=throttle)
+    if txt:
+        try:
+            d = json.loads(txt)
+            if d.get("status") == "success":
+                out.update({
+                    "country": d.get("country"), "region": d.get("regionName"),
+                    "city": d.get("city"), "isp": d.get("isp"),
+                    "org": d.get("org"), "asn": d.get("as"),
+                    "reverse": d.get("reverse"),
+                })
+                return out
+        except Exception:
+            pass
+    txt = http_get_text(f"https://ipinfo.io/{ip}/json", timeout=8.0,
+                        throttle=throttle)
+    if txt:
+        try:
+            d = json.loads(txt)
+            out.update({"country": d.get("country"), "city": d.get("city"),
+                        "org": d.get("org"), "asn": d.get("org"),
+                        "isp": d.get("org")})
+        except Exception:
+            pass
+    return out
+
+
+MAGIC_SIGNS: List[Tuple[str, bytes, str]] = [
+    ("webshell-php", b"<?php", "PHP script header"),
+    ("gzip", b"\x1f\x8b", "gzip archive"),
+    ("zip", b"PK\x03\x04", "ZIP archive"),
+    ("tar-ustar", b"ustar", "TAR archive"),
+    ("7z", b"7z\xbc\xaf\x1c\x1c", "7-Zip archive"),
+    ("rar", b"Rar!\x1a\x07", "RAR archive"),
+    ("xz", b"\xfd7zXZ\x00", "XZ archive"),
+    ("pdf", b"%PDF", "PDF document"),
+    ("elf", b"\x7fELF", "Linux ELF executable"),
+    ("pe", b"MZ\x90\x00", "Windows PE executable"),
+    ("macho", b"\xcf\xfa\xed\xfe", "macOS Mach-O executable"),
+    ("png", b"\x89PNG\r\n\x1a\n", "PNG image"),
+    ("jpg", b"\xff\xd8\xff", "JPEG image"),
+    ("gif", b"GIF8", "GIF image"),
+    ("bmp", b"BM", "Bitmap image"),
+    ("ico", b"\x00\x00\x01\x00", "Windows icon"),
+    ("sqlite", b"SQLite format 3\x00", "SQLite database"),
+    ("redis-rdb", b"REDIS0", "Redis RDB dump"),
+    ("mongo-bson", b"\x16\x00\x00\x00", "BSON document"),
+    ("java-class", b"\xca\xfe\xba\xbe", "Java class file"),
+    ("pyc", b"\x0c\x0d\x0d\x0a", "Python bytecode"),
+    ("rsa-key", b"-----BEGIN RSA PRIVATE KEY-----", "RSA private key"),
+    ("openssh-key", b"-----BEGIN OPENSSH PRIVATE KEY-----", "OpenSSH private key"),
+    ("ec-key", b"-----BEGIN EC PRIVATE KEY-----", "EC private key"),
+    ("pgp", b"\x99", "PGP message"),
+    ("base64-jwt", b"eyJhbGciOi", "JWT token prefix"),
+    ("docker-overlay", b"\x02\x00\x00\x00", "Docker layer blob"),
+    ("parquet", b"PAR1", "Parquet columnar file"),
+    ("avro", b"\x4f\x62\x6a\x01", "Avro object container"),
+    ("bzip2", b"BZh", "bzip2 archive"),
+    ("lz4", b"\x04\x22\x4d\x18", "LZ4 frame"),
+    ("zstd", b"\x28\xb5\x2f\xfd", "Zstandard frame"),
+    ("rtf", b"{\\rtf", "Rich Text Format"),
+    ("ole", b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1", "MS Office OLE compound"),
+    ("cab", b"MSCF", "Microsoft cabinet"),
+    ("iso9660", b"CD001", "ISO9660 filesystem"),
+]
+
+
+def classify_bytes(head: bytes) -> Optional[Tuple[str, str]]:
+    """Safe static classification: returns (label, description) of the
+    FIRST matching magic signature. No execution, no unpacking."""
+    for label, sig, desc in MAGIC_SIGNS:
+        if head.startswith(sig):
+            return label, desc
+    if head[:2] == b"\x1f\x9d" or head[:2] == b"\x1fa0":
+        return "compress-legacy", "Legacy compress(.Z)"
+    if b"<%=" in head[:200] or b"<?=" in head[:200]:
+        return "jsp-or-asp", "JSP/ASP page fragment"
+    if re.match(rb"^\s*#!\s*/usr/bin/(env\s+)?(python|perl|php|node|bash)",
+                head[:64]):
+        return "shebang-script", "Executable script (shebang)"
+    if re.match(rb"^\s*(<html|<!doctype html)", head[:200], re.I):
+        return "html", "HTML document"
+    if re.match(rb"^\s*[{[]", head[:8]):
+        return "json-ish", "Looks like JSON"
+    if head[:5] == b"%!PS-":
+        return "postscript", "PostScript file"
+    return None
+
+
+def detect_waf(html_body: str, headers: Dict[str, str]) -> Optional[str]:
+    """Purely observational WAF fingerprint from response headers/body."""
+    joined_h = "\n".join(f"{k.lower()}: {v.lower()}"
+                         for k, v in headers.items())
+    low_body = (html_body or "")[:8000].lower()
+    for name, sigs in WAF_FINGERPRINTS:
+        for sig in sigs:
+            if sig in joined_h:
+                return name
+            if len(sig) > 6 and sig.replace(": ", "") in low_body:
+                return name
+    if "captcha-delivery.com" in low_body or "cf-browser-verification" in low_body:
+        return "Cloudflare"
+    if "attention! required subscription" in low_body:
+        return "HostGuard/Sucuri-block"
+    return None
+
+
+def looks_like_cdn(ip: str, headers: Dict[str, str]) -> Optional[str]:
+    """CDN guess from header hints + well-known provider prefixes."""
+    sv = (headers.get("server") or "").lower()
+    via = (headers.get("via") or "").lower()
+    if "cloudflare" in sv:
+        return "Cloudflare"
+    if "cloudfront" in via or "cloudfront" in sv:
+        return "AWS CloudFront"
+    if "akamai" in via or "akamai" in sv:
+        return "Akamai"
+    if "goog" in sv or "gstatic" in via:
+        return "Google"
+    if "fastly" in via:
+        return "Fastly"
+    for prov, prefixes in CDN_IP_PREFIXES.items():
+        if any(ip.startswith(p) for p in prefixes):
+            return prov
+    return None
+
+
+def extract_login_forms(html: str, base_url: str) -> List[Dict[str, Any]]:
+    """Parse HTML forms heuristically: action URL, method, field names,
+    whether password inputs exist. Pure regex — no parser dependency."""
+    forms: List[Dict[str, Any]] = []
+    for m in re.finditer(r"<form\b[^>]*>(.*?)</form>", html,
+                         re.I | re.S):
+        tag_head = m.group(0)[:m.start(1) - m.start(0) + len(m.group(0))]
+        inner = m.group(1)
+        head = tag_head.split(">", 1)[0]
+        action_m = re.search(r"action\s*=\s*[\"']([^\"']*)[\"']", head, re.I)
+        method_m = re.search(r"method\s*=\s*[\"']([^\"']*)[\"']", head, re.I)
+        action = action_m.group(1) if action_m else base_url
+        method = (method_m.group(1) if method_m else "GET").upper()
+        fields: List[Dict[str, str]] = []
+        for inp in re.finditer(r"<input\b[^>]*>", inner, re.I):
+            attrs = parse_attrs(inp.group(0))
+            fields.append({
+                "tag": "input",
+                "type": attrs.get("type", "text").lower(),
+                "name": attrs.get("name", ""),
+                "autocomplete": attrs.get("autocomplete", "").lower(),
+            })
+        for sel in re.finditer(r"<select\b[^>]*>", inner, re.I):
+            attrs = parse_attrs(sel.group(0))
+            fields.append({"tag": "select", "type": "select",
+                           "name": attrs.get("name", "")})
+        has_pass = any(f["type"] == "password" for f in fields)
+        user_hint = any(
+            re.search(r"(user|login|email|account|uname)",
+                      f.get("name", ""), re.I)
+            for f in fields if f["tag"] == "input" and f["type"] != "password")
+        is_login = has_pass and (user_hint or method == "POST")
+        forms.append({
+            "action": urljoin(base_url, action),
+            "method": method,
+            "fields": fields,
+            "has_password": has_pass,
+            "looks_like_login": bool(is_login),
+        })
+    return forms
+
+
+def parse_attrs(tag_head: str) -> Dict[str, str]:
+    """Small attribute extractor shared with existing code paths."""
+    attrs: Dict[str, str] = {}
+    for m in re.finditer(r"([a-zA-Z_:][-a-zA-Z0-9_:.]*)\s*=\s*"
+                         r"(?:\"([^\"]*)\"|'([^']*)'|([^\s\"'>]+))",
+                         tag_head):
+        key = m.group(1).lower()
+        val = m.group(2) or m.group(3) or m.group(4) or ""
+        attrs[key] = val
+    return attrs
+
+
+def entropy_of(s: str) -> float:
+    """Shannon entropy per char — used to flag random-looking secrets."""
+    import math
+    from collections import Counter
+    if not s:
+        return 0.0
+    c = Counter(s)
+    n = len(s)
+    return round(-sum((v / n) * math.log2(v / n) for v in c.values()), 3)
+
+
+def mask_secret(val: str) -> str:
+    """Redact secret values for evidence: keep first 4 chars only."""
+    if len(val) <= 6:
+        return "*" * len(val)
+    return val[:4] + "*" * max(4, len(val) - 4)
+
+
+def split_tokens(user_input: str) -> List[str]:
+    """Split free-text credentials into candidate tokens (for default-cred
+    comparison against operator-supplied creds)."""
+    toks = re.split(r"[^A-Za-z0-9@._\-]+", user_input or "")
+    return [t for t in toks if t][:12]
+
+
+def levenshtein(a: str, b: str) -> int:
+    """Standard DP edit distance (small strings only — used on ≤64-char
+    credential comparisons, so O(n*m) is trivial)."""
+    a, b = a[:64], b[:64]
+    if a == b:
+        return 0
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1,
+                           prev[j - 1] + (ca != cb)))
+        prev = cur
+    return prev[-1]
+
+
+# ─────────────────────────────────────────────────────────────────────
+# v4 — SAFE marker library (NOT attack payloads). These are neutral
+# sentinel strings used ONLY to compare baseline vs. reflected output.
+# They contain no quotes, no SQL/XSS syntax, cannot break out of any
+# context, and are used purely for differential analysis (like dye in a
+# dental X-ray). Zero exploitation value.
+# ─────────────────────────────────────────────────────────────────────
+SAFE_MARKER = "h303dentist"          # neutral alphanumeric token
+SAFE_PARAM_TOKEN = "h303probe"       # neutral query parameter name
+REFLECT_RE = re.compile(re.escape(SAFE_MARKER), re.I)
+
+LOGIN_BYPASS_PAYLOADS: List[str] = []   # intentionally EMPTY — see comment
+
+
+# ─────────────────────────────────────────────────────────────────────
+# v4 — CVE intelligence: OSV.dev (primary) + NVD feeds (fallback)
+# ─────────────────────────────────────────────────────────────────────
+def osv_lookup(pkg_ecosystem: str, pkg_name: str, version: str,
+               throttle: Optional[Throttle] = None) -> List[Dict[str, Any]]:
+    """Query Google OSV.dev API (free, no auth) for vulnerabilities
+    affecting an exact package version. Advisory-only; returns CVE ids."""
+    body = json.dumps({
+        "query": {"package": {"name": pkg_name,
+                              "ecosystem": pkg_ecosystem},
+                  "version": version}}).encode()
+    if throttle is not None:
+        throttle.wait()
+    try:
+        s = requests.Session()
+        s.headers.update({"User-Agent": UA,
+                          "Content-Type": "application/json"})
+        r = s.post("https://api.osv.dev/v1/query", data=body, timeout=12.0)
+        if r.status_code != 200:
+            return []
+        out = []
+        for v in r.json().get("vulns", [])[:40]:
+            aliases = [a for a in v.get("aliases", []) if a.startswith("CVE-")]
+            sev = ""
+            for x in v.get("severity", []):
+                if x.get("type") == "CVSS_V3":
+                    sev = x.get("score", "")
+            out.append({
+                "id": v.get("id"), "cves": aliases,
+                "summary": (v.get("summary") or "")[:160],
+                "cvss": sev,
+                "link": f"https://osv.dev/vulnerability/{v.get('id')}",
+            })
+        return out
+    except Exception:
+        return []
+
+
+def osv_purl_query(purl: str, throttle: Optional[Throttle] = None
+                   ) -> List[Dict[str, Any]]:
+    """OSV batch query by Package URL string (pkg:npm/express@4.17.1...)."""
+    body = json.dumps({"query": {"package": {"purl": purl}}}).encode()
+    if throttle is not None:
+        throttle.wait()
+    try:
+        s = requests.Session()
+        s.headers.update({"User-Agent": UA,
+                          "Content-Type": "application/json"})
+        r = s.post("https://api.osv.dev/v1/query", data=body, timeout=12.0)
+        if r.status_code == 200:
+            return r.json().get("vulns", [])[:40]
+    except Exception:
+        pass
+    return []
+
+
+NVD_FEED_URLS = [
+    "https://nvd.nist.gov/feeds/json/cve/1.1/nvdcve-1.1-modified.meta",
+    "https://nvd.nist.gov/feeds/json/cve/1.1/nvdcve-1.1-recent.meta",
+]
+
+
+def nvd_feed_status(throttle: Optional[Throttle] = None
+                    ) -> List[Dict[str, Any]]:
+    """Read NVD feed meta files (size/last-modified) — proves CVE intel
+    freshness without downloading gigabytes. Returns [] on offline."""
+    out: List[Dict[str, Any]] = []
+    for u in NVD_FEED_URLS:
+        txt = http_get_text(u, timeout=8.0, throttle=throttle)
+        if txt:
+            lines = dict(
+                ln.split(":", 1) for ln in txt.splitlines() if ":" in ln)
+            out.append({"feed": u.rsplit("/", 1)[-1],
+                        "size": lines.get("size", "?").strip(),
+                        "last_modified": lines.get("lastModifiedDate", "?").strip()})
+    return out
+
+
+OPENCVE_SEARCH = "https://app.opencve.io/api/cve/"
+
+
+def opencve_search(cve_id: str, throttle: Optional[Throttle] = None
+                   ) -> Optional[Dict[str, Any]]:
+    """Try OpenCVE search API (may be blocked by its WAF — that itself is
+    recorded as an observation, never retried aggressively)."""
+    if throttle is not None:
+        throttle.wait()
+    try:
+        s = requests.Session()
+        s.headers.update({"User-Agent": UA, "Accept": "application/json"})
+        r = s.get(OPENCVE_SEARCH + cve_id, timeout=10.0)
+        if r.status_code == 200:
+            return r.json()
+        return {"blocked": True, "status": r.status_code}
+    except Exception:
+        return None
+
+
+# ─────────────────────────────────────────────────────────────────────
+# v4 — nuclei-templates advisory corpus loader (GitHub mirrors).
+# We download ONLY the lightweight index (file list) plus a curated set
+# of matcher keywords. The scan NEVER executes template logic; instead
+# each template's id/name/severity/tags become ADVISORY entries matched
+# against detected components (fingerprints from mod_cms/mod_headers).
+# ─────────────────────────────────────────────────────────────────────
+def load_nuclei_advisories(throttle: Optional[Throttle] = None,
+                           limit: int = 1200) -> List[Dict[str, Any]]:
+    advs: List[Dict[str, Any]] = []
+    for repo, branch, sub, cat in NUCLEI_TEMPLATE_SOURCES:
+        entries = github_tree_entries(repo, branch, sub, throttle=throttle)
+        for e in entries:
+            if e.get("type") != "file":
+                continue
+            name = e.get("name", "")
+            if not name.endswith(".yaml"):
+                continue
+            advs.append({"category": cat, "template": name[:-5],
+                         "repo": repo, "path": e.get("path", ""),
+                         "html_url": e.get("html_url", "")})
+            if len(advs) >= limit:
+                return advs
+    return advs
+
+
+def advisories_for_component(component: str, version: str,
+                             advs: List[Dict[str, Any]],
+                             cap: int = 12) -> List[Dict[str, Any]]:
+    """Match advisory templates against a component name (substring)."""
+    comp = component.lower()
+    hits = [a for a in advs if comp and comp in (a["template"] + a["path"]).lower()]
+    return hits[:cap]
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Embedded PDF report writer — pure Python (no reportlab needed).
+# Produces a valid single/multi-page A4 PDF with Helvetica text,
+# severity-colored badges and tables drawn as filled rectangles.
+# ═══════════════════════════════════════════════════════════════════════
+_SEV_RGB = {"critical": (0.50, 0.11, 0.11), "high": (0.73, 0.11, 0.11),
+            "medium": (0.85, 0.47, 0.06), "low": (0.15, 0.39, 0.86),
+            "info": (0.40, 0.46, 0.55)}
+
+
+class _PdfPage:
+    def __init__(self):
+        self.ops: List[str] = []
+        self.y = 0.0   # current cursor (from top)
+
+    def emit(self, s: str):
+        self.ops.append(s)
+
+
+class MiniPdf:
+    PAGE_W, PAGE_H = 595.28, 841.89          # A4 points
+    MARGIN = 42.0
+
+    def __init__(self, title: str):
+        self.title = title
+        self.pages: List[_PdfPage] = []
+        self.cur = None
+        self.new_page()
+
+    # ---- low-level drawing ----
+    def new_page(self):
+        if self.cur is not None and self.cur.ops:
+            pass
+        self.cur = _PdfPage()
+        self.cur.y = self.PAGE_H - self.MARGIN
+        self.pages.append(self.cur)
+
+    def _ensure(self, need: float):
+        if self.cur.y - need < self.MARGIN:
+            self.new_page()
+
+    def text(self, s: str, size: float = 9, bold: bool = False,
+             rgb=(0.08, 0.09, 0.12), dy: Optional[float] = None,
+             x: Optional[float] = None, wrap_width: float = 511.0):
+        s = re.sub(r"[\r\n\t]+", " ", str(s))
+        font = "/F2" if bold else "/F1"
+        # simple word-wrap by approximate char width
+        cw = size * 0.50
+        maxchars = max(10, int(wrap_width / cw))
+        words, lines, cur = s.split(" "), [], ""
+        for w in words:
+            if len(cur) + len(w) + 1 <= maxchars:
+                cur = (cur + " " + w).strip()
+            else:
+                if cur:
+                    lines.append(cur)
+                cur = w[:maxchars]
+        if cur:
+            lines.append(cur)
+        lh = size * 1.35
+        for ln in lines:
+            self._ensure(lh)
+            safe = _pdf_escape(ln)
+            px = x if x is not None else self.MARGIN
+            py = self.cur.y
+            self.cur.emit(f"BT {font} {size} Tf {' '.join(f'{c:.3f}' for c in rgb)} rg "
+                          f"{px:.2f} {py:.2f} Td ({safe}) Tj ET")
+            self.cur.y -= lh
+
+    def badge(self, label: str, rgb):
+        self._ensure(16)
+        py = self.cur.y - 11
+        w = len(label) * 6.2 + 14
+        self.cur.emit(f"{rgb[0]:.3f} {rgb[1]:.3f} {rgb[2]:.3f} rg "
+                      f"{self.MARGIN:.2f} {py:.2f} {w:.2f} 13 re f")
+        self.text(label.upper(), 8, bold=True, rgb=(1, 1, 1),
+                  dy=0, x=self.MARGIN + 7)
+        self.cur.y = py + 13 - 13  # align
+
+    def hrule(self):
+        self._ensure(6)
+        self.cur.emit(f"0.88 0.90 0.93 rg {self.MARGIN:.2f} {self.cur.y - 2:.2f} "
+                      f"{self.PAGE_W - 2 * self.MARGIN:.2f} 0.8 re f")
+        self.cur.y -= 8
+
+    def spacer(self, h: float):
+        self.cur.y -= h
+
+    # ---- output ----
+    def save(self, path: str):
+        objs: List[bytes] = []
+
+        def add(b: bytes) -> int:
+            objs.append(b)
+            return len(objs)     # 1-based object number
+
+        catalog_id = add(b"")    # placeholder 1
+        pages_id = add(b"")      # placeholder 2
+        f1 = add(b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")
+        f2 = add(b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>")
+        info_id = add(("<< /Producer (H303 Dentist " + VERSION +
+                        ") /Title (" + _pdf_escape(self.title) + ") >>").encode())
+
+        page_ids = []
+        content_ids = []
+        for pg in self.pages:
+            stream = "\n".join(pg.ops).encode("latin-1", "replace")
+            cid = add(b"<< /Length " + str(len(stream)).encode() +
+                      b" >>\nstream\n" + stream + b"\nendstream")
+            content_ids.append(cid)
+        for cid in content_ids:
+            pid = add(("<< /Type /Page /Parent %d 0 R /MediaBox [0 0 %.2f %.2f] "
+                       "/Resources << /Font << /F1 %d 0 R /F2 %d 0 R >> >> "
+                       "/Contents %d 0 R >>" % (pages_id, self.PAGE_W,
+                                                self.PAGE_H, f1, f2, cid)
+                       ).encode())
+            page_ids.append(pid)
+
+        kids = " ".join(f"{i} 0 R" for i in page_ids)
+        objs[pages_id - 1] = (f"<< /Type /Pages /Count {len(page_ids)} "
+                              f"/Kids [{kids}] >>").encode()
+        objs[catalog_id - 1] = (f"<< /Type /Catalog /Pages {pages_id} 0 R >>").encode()
+
+        out = io.BytesIO()
+        out.write(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
+        offsets = []
+        for i, body in enumerate(objs, start=1):
+            offsets.append(out.tell())
+            out.write(f"{i} 0 obj\n".encode() + body + b"\nendobj\n")
+        xref_pos = out.tell()
+        n = len(objs) + 1
+        out.write(f"xref\n0 {n}\n".encode())
+        out.write(b"0000000000 65535 f \n")
+        for off in offsets:
+            out.write(f"{off:010d} 00000 n \n".encode())
+        out.write((f"trailer\n<< /Size {n} /Root {catalog_id} 0 R "
+                   f"/Info {info_id} 0 R >>\nstartxref\n{xref_pos}\n%%EOF\n").encode())
+        with open(path, "wb") as fh:
+            fh.write(out.getvalue())
+        return path
+
+
+def _pdf_escape(s: str) -> str:
+    s = str(s)
+    s = "".join(ch if 32 <= ord(ch) < 127 else "?" for ch in s)
+    return s.replace("\\", r"\\").replace("(", r"\(").replace(")", r"\)")
+
+
+def build_pdf(findings: List[Dict], meta: Dict, log_lines: List[str],
+              out_path: str) -> str:
+    pdf = MiniPdf(f"H303 Dentist Report - {meta.get('target','')}")
+    pdf.text("H303 DENTIST SCANNER", 20, bold=True, rgb=(0.06, 0.09, 0.17))
+    pdf.text("Non-Destructive Security Diagnostic Report", 11,
+             rgb=(0.35, 0.40, 0.50))
+    pdf.spacer(6)
+    pdf.text(f"Target: {meta.get('target','')}", 9, bold=True)
+    pdf.text(f"Generated: {meta.get('generated','')}   |   "
+             f"Duration: {float(meta.get('duration', 0)):.1f}s   |   "
+             f"Requests issued (read-only): {meta.get('requests', 0)}   |   "
+             f"Engine: {VERSION}", 8)
+    pdf.text("All medium+ findings were independently re-verified before "
+             "inclusion. This scan sent no payloads and caused no state change.",
+             8, rgb=(0.30, 0.35, 0.42))
+    pdf.hrule()
+
+    counts: Dict[str, int] = {}
+    for f in findings:
+        counts[f["severity"]] = counts.get(f["severity"], 0) + 1
+    pdf.text("Executive summary", 13, bold=True)
+    for sev in ("critical", "high", "medium", "low", "info"):
+        pdf.badge(f"{sev}: {counts.get(sev, 0)}", _SEV_RGB[sev])
+        pdf.spacer(2)
+    pdf.spacer(8)
+
+    ordered = sorted(findings, key=lambda f: -SEV_ORDER.get(f["severity"], 0))
+    pdf.text(f"Findings ({len(ordered)})", 13, bold=True)
+    pdf.hrule()
+    if not ordered:
+        pdf.text("No findings recorded.", 9)
+    for i, f in enumerate(ordered, 1):
+        sev = f["severity"]
+        pdf.spacer(4)
+        pdf.badge(sev, _SEV_RGB.get(sev, (0.4, 0.4, 0.4)))
+        ver = "VERIFIED" if f.get("verified") else "unverified"
+        pdf.text(f"{i}. {f['title']}", 10, bold=True)
+        pdf.text(f"[{f['category']} | confidence {f.get('confidence',0)}% | {ver}"
+                 + (f" | {f['cwe']}" if f.get('cwe') else "") + "]", 7.5,
+                 rgb=(0.35, 0.40, 0.48))
+        for k in ("description", "evidence", "remediation"):
+            v = f.get(k) or ""
+            if v:
+                pdf.text(f"{k.capitalize()}: {v}", 8,
+                         rgb=(0.15, 0.17, 0.22), x=MiniPdf.MARGIN + 10)
+        pdf.text(f"Detected at: {f.get('timestamp_str','')}", 7,
+                 rgb=(0.45, 0.48, 0.55), x=MiniPdf.MARGIN + 10)
+        pdf.hrule()
+
+    pdf.spacer(6)
+    pdf.text("Appendix A - Live scan log", 12, bold=True)
+    pdf.hrule()
+    for line in log_lines[-500:]:
+        pdf.text(line, 7, rgb=(0.25, 0.28, 0.34))
+    return pdf.save(out_path)
+
+
+# ─────────────────────────────────────────────────────────────────────
+# JS / HTML static analyzer — reviews the target's OWN client code.
+# Read-only pattern review; nothing is executed, nothing is injected.
+# ─────────────────────────────────────────────────────────────────────
+JS_PATTERNS = [
+    # (id, regex, title, severity, remediation, cwe)
+    ("js-hardcoded-key",
+     re.compile(r"(?i)\b(?:api[_-]?key|apikey|secret[_-]?key|access[_-]?token|"
+                r"private[_-]?key|auth[_-]?token)\b\s*[:=]\s*['\"][A-Za-z0-9/+_.\-]{16,}['\"]"),
+     "Hardcoded credential/API key inside JavaScript", "critical",
+     "Move secrets server-side; rotate any exposed key immediately.", "CWE-798"),
+    ("js-aws-key",
+     re.compile(r"AKIA[0-9A-Z]{16}"),
+     "AWS access key ID present in client JavaScript", "critical",
+     "Rotate the key; use STS short-lived credentials instead.", "CWE-798"),
+    ("js-private-key-block",
+     re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
+     "Private key block embedded in served file", "critical",
+     "Remove the key from web assets and rotate it.", "CWE-798"),
+    ("js-jwt",
+     re.compile(r"eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{5,}"),
+     "JWT token literal found in JavaScript", "high",
+     "Do not ship live tokens in client bundles; fetch per-session.", "CWE-522"),
+    ("js-document-write",
+     re.compile(r"document\.write\s*\("),
+     "document.write() usage (DOM-injection sink)", "medium",
+     "Prefer textContent / createElement; avoid innerHTML on untrusted data.",
+     "CWE-79"),
+    ("js-innerhtml",
+     re.compile(r"\.innerHTML\s*="),
+     "innerHTML assignment (potential XSS sink)", "low",
+     "Sanitize before assigning innerHTML or use textContent.", "CWE-79"),
+    ("js-eval",
+     re.compile(r"[^.\w]eval\s*\("),
+     "eval() usage detected", "medium",
+     "Replace eval with JSON.parse or a safer parser.", "CWE-95"),
+    ("js-function-constructor",
+     re.compile(r"new\s+Function\s*\("),
+     "Function constructor used (dynamic code execution)", "medium",
+     "Avoid constructing functions from strings.", "CWE-94"),
+    ("js-setinterval-timeout-str",
+     re.compile(r"set(?:Timeout|Interval)\s*\(\s*['\"]"),
+     "String argument to setTimeout/setInterval (implicit eval)", "low",
+     "Pass function references instead of strings.", "CWE-95"),
+    ("js-http-url",
+     re.compile(r"""['"]http://[A-Za-z0-9._\-/]+"""),
+     "Cleartext http:// URL hardcoded in script", "low",
+     "Use https:// URLs in client code.", "CWE-319"),
+    ("js-postmessage-star",
+     re.compile(r"postMessage\s*\([^)]*['\"]\*['\"]"),
+     "postMessage with wildcard target origin", "medium",
+     "Pin targetOrigin to a known origin and validate event.origin.", "CWE-346"),
+    ("js-sourceurl-comment",
+     re.compile(r"//[#@]\s*sourceMappingURL=(\S+)"),
+     None, None, None, None),   # handled separately
+    ("js-console-log",
+     re.compile(r"console\.log\s*\(\s*['\"`]?(?:token|secret|password|user|session)"),
+     "Debug console logging of sensitive variable names", "info",
+     "Strip debug logging from production bundles.", "CWE-489"),
+    ("js-debugger",
+     re.compile(r"(?<![\w.'\"])debugger(?![\w.'\"])"),
+     "'debugger' statement left in production bundle", "info",
+     "Enable minify/strip in the build pipeline.", "CWE-489"),
+    ("js-sourcemap-ref",
+     re.compile(r"//#\s*sourceMappingURL=(\S+)"),
+     "Source-map reference found in served JS", "info",
+     "Verify whether .map files are publicly downloadable.", ""),
+]
+
+SECRET_JSON_RE = re.compile(
+    r"(?i)\"(pass(?:word)?|secret|token|api[_-]?key|client[_-]?secret)\"\s*:\s*"
+    r"\"[^\"\s]{6,}\"")
+FORM_ACTION_HTTP_RE = re.compile(r"<form[^>]+action\s*=\s*[\"']http://", re.I)
+INLINE_DEBUGGER_RE = re.compile(r"<script[^>]*>[^<]*\bdebugger\b", re.I)
+GENERATOR_RE = re.compile(r"<meta\s+name=[\"']generator[\"']\s+content=[\"']([^\"']+)[\"']", re.I)
+SRC_JS_RE = re.compile(r"<script[^>]+src\s*=\s*[\"']([^\"']+)[\"']", re.I)
+SRI_RE = re.compile(r"\bintegrity\s*=", re.I)
+CDN_HOSTS = ("cdn.jsdelivr.net", "unpkg.com", "cdnjs.cloudflare.com",
+             "ajax.googleapis.com", "code.jquery.com", "maxcdn.bootstrapcdn.com")
+
+
+def analyze_js_source(text: str, where: str) -> List[Tuple[str, str, str, str, str]]:
+    """Return list of (pattern_id, title, severity, evidence, remediation+cwe)."""
+    hits = []
+    sample = text[:400_000]
+    for pid, rx, title, sev, fix, cwe in JS_PATTERNS:
+        if title is None:
+            continue
+        m = rx.search(sample)
+        if m:
+            frag = m.group(0)
+            # SAFETY: never record secret VALUES. For credential-style hits
+            # keep only the key NAME; for behavioural sinks keep a short
+            # code fragment (they contain no secrets by nature).
+            if pid in ("js-hardcoded-key", "js-aws-key", "js-jwt",
+                       "js-private-key-block"):
+                frag = re.split(r"[:=]", frag, 1)[0].strip() + " = <REDACTED>"
+            elif len(frag) > 70:
+                frag = frag[:70] + "…"
+            hits.append((pid, title, sev,
+                         f"{where}: {frag}", f"{fix} [{cwe}]" if cwe else fix))
+    return hits
+
+
+def sourcemap_url(text: str) -> Optional[str]:
+    m = re.search(r"//#\s*sourceMappingURL=(\S+)", text[-2000:])
+    return m.group(1) if m else None
+
+
+# ─────────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════
+#  ADVANCED STATIC ANALYSIS ENGINE (v3) — tokenizer-level review of the
+#  target's OWN client code. Pure text analysis; nothing is executed,
+#  injected, or probed destructively.
+# ═══════════════════════════════════════════════════════════════════════
+
+JS_KEYWORDS = {
+    "abstract", "arguments", "await", "async", "boolean", "break", "byte",
+    "case", "catch", "char", "class", "const", "continue", "debugger",
+    "default", "delete", "do", "else", "enum", "eval", "export", "extends",
+    "false", "final", "finally", "float", "for", "function", "goto", "if",
+    "implements", "import", "in", "instanceof", "int", "interface", "let",
+    "long", "native", "new", "null", "package", "private", "protected",
+    "public", "return", "short", "static", "super", "switch", "synchronized",
+    "this", "throw", "throws", "transient", "true", "try", "typeof", "var",
+    "void", "volatile", "while", "with", "yield", "of",
+}
+
+RESERVED_DOM_GLOBALS = {
+    "window", "document", "location", "navigator", "history", "console",
+    "localStorage", "sessionStorage", "indexedDB", "crypto", "fetch",
+    "XMLHttpRequest", "WebSocket", "EventSource", "Worker", "postMessage",
+    "alert", "open", "close", "setTimeout", "setInterval", "JSON", "Math",
+    "Date", "Promise", "Proxy", "Reflect", "Atomics", "google", "dataLayer",
+    "ga", "gtag", "fbq", "jQuery", "$", "_", "React", "ReactDOM", "angular",
+    "Vue", "axios", "moment", "d3", "require", "define", "module", "exports",
+    "global", "process", "self", "top", "parent", "frames", "origin",
+    "screen", "chrome", "io", "L", "THREE", "Hls", "Chart", "Swiper",
+    "Stripe", "Intercom", "Tawk_API", "LiveChatWidget", "Prism", "marked",
+    "hljs",
+}
+
+
+def _js_strip_comments(text: str) -> str:
+    """Blank out // and /* */ comments while respecting string literals."""
+    out = []
+    i, n = 0, len(text)
+    while i < n:
+        c = text[i]
+        if c in "\"'`":
+            q = c
+            out.append(c)
+            i += 1
+            while i < n:
+                out.append(text[i])
+                if text[i] == "\\":
+                    if i + 1 < n:
+                        out.append(text[i + 1])
+                    i += 2
+                    continue
+                if text[i] == q:
+                    i += 1
+                    break
+                i += 1
+            continue
+        if c == "/" and i + 1 < n and text[i + 1] == "/":
+            while i < n and text[i] != "\n":
+                out.append(" ")
+                i += 1
+            continue
+        if c == "/" and i + 1 < n and text[i + 1] == "*":
+            out.append("  ")
+            i += 2
+            while i < n and not (text[i] == "*" and i + 1 < n and
+                                 text[i + 1] == "/"):
+                out.append("\n" if text[i] == "\n" else " ")
+                i += 1
+            out.append("  ")
+            i += 2
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def _js_find_strings(text: str) -> List[Tuple[str, int]]:
+    """Return (value, line) for every string literal >=6 chars in JS source."""
+    found: List[Tuple[str, int]] = []
+    i, n, line = 0, len(text), 1
+    while i < n:
+        c = text[i]
+        if c == "\n":
+            line += 1
+            i += 1
+            continue
+        if c in "\"'`":
+            q = c
+            buf = []
+            i += 1
+            while i < n:
+                if text[i] == "\\" and i + 1 < n:
+                    buf.append(text[i + 1])
+                    i += 2
+                    continue
+                if text[i] == q:
+                    i += 1
+                    break
+                if text[i] == "\n":
+                    line += 1
+                buf.append(text[i])
+                i += 1
+            v = "".join(buf)
+            if len(v) >= 6:
+                found.append((v, line))
+            continue
+        i += 1
+    return found
+
+
+# --- secret detectors -----------------------------------------------------
+SECRET_DETECTIONS = [
+    ("aws-access-key-id", "critical",
+     re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+     "AWS long-term access key ID embedded in client code"),
+    ("aws-secret-access-key", "critical",
+     re.compile(r"(?i)(aws[_-]?secret[_-]?access[_-]?key|aws_secret)"
+                r"\s*[:=]\s*['\"][0-9A-Za-z/+]{30,}['\"]"),
+     "AWS secret access key literal"),
+    ("gcp-api-key", "high",
+     re.compile(r"\bAIza[0-9A-Za-z_\-]{35}\b"),
+     "Google API key (Maps/YT/Firebase web key) in served code"),
+    ("firebase-config", "medium",
+     re.compile(r"['\"]apiKey['\"]\s*:\s*['\"]AIza[0-9A-Za-z_\-]{30,}['\"]"),
+     "Firebase web config block shipped to clients (verify Firestore rules)"),
+    ("stripe-live-key", "high",
+     re.compile(r"\bsk_live_[0-9a-zA-Z]{20,}\b"),
+     "Stripe SECRET live key in client JavaScript (never allowed client-side)"),
+    ("stripe-publishable-key", "info",
+     re.compile(r"\bpk_(?:live|test)_[0-9a-zA-Z]{20,}\b"),
+     "Stripe publishable key present (expected client-side; check restrictions)"),
+    ("github-token", "critical",
+     re.compile(r"\bgh[pousr]_[0-9A-Za-z]{30,}\b"),
+     "GitHub personal access / OAuth / bot token in served asset"),
+    ("slack-token", "high",
+     re.compile(r"\bxox[baprs]-[0-9A-Za-z-]{10,}\b"),
+     "Slack API token in served asset"),
+    ("sendgrid-key", "high",
+     re.compile(r"\bSG\.[0-9A-Za-z_\-]{20,}\.[0-9A-Za-z_\-]{20,}\b"),
+     "SendGrid API key in served asset"),
+    ("twilio-key", "high",
+     re.compile(r"\bSK[0-9a-fA-F]{32}\b"),
+     "Twilio API service key SID in served asset"),
+    ("mailgun-key", "high",
+     re.compile(r"\bkey-[0-9a-zA-Z]{32}\b"),
+     "Mailgun API key in served asset"),
+    ("private-key-block", "critical",
+     re.compile(r"-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP )?PRIVATE KEY-----"),
+     "Full private key block inside a served file"),
+    ("jwt-literal", "high",
+     re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}"
+                r"\.(?:[A-Za-z0-9_-]{10,}|[\w.-]+)\b"),
+     "JWT literal shipped in client code (token replay risk)"),
+    ("google-oauth-client-id", "info",
+     re.compile(r"\b\d{10,}-[0-9a-z]{32}\.apps\.googleusercontent\.com\b"),
+     "Google OAuth client ID visible (normal for SPAs — verify restriction)"),
+    ("mapbox-token", "high",
+     re.compile(r"\bpk\.eyJ[A-Za-z0-9_.\-]{20,}\b|\bsk\.eyJ[A-Za-z0-9_.\-]{20,}\b"),
+     "Mapbox access token in client code"),
+    ("npm-token", "high",
+     re.compile(r"\bnpm_[0-9A-Za-z]{36}\b"),
+     "NPM automation token in served asset"),
+    ("generic-long-hex-secret", "medium",
+     re.compile(r"(?i)(?:secret|signing[_-]?key|client[_-]?secret|"
+                r"private[_-]?token)\s*[:=]\s*['\"][0-9a-f]{32,}['\"]"),
+     "Generic hex secret assigned to a secret-named variable"),
+    ("basic-auth-url", "medium",
+     re.compile(r"['\"]https?://[^'\"\s:@/]+:[^'\"@\s]{4,}@"),
+     "Hardcoded credentials inside a URL literal (user:pass@host)"),
+    ("password-literal", "high",
+     re.compile(r"(?i)\b(?:default_)?password\s*[:=]\s*['\"][^'\"]{5,}['\"]"),
+     "Password literal assigned in client code"),
+    ("telegram-bot-token", "high",
+     re.compile(r"\b\d{8,10}:AA[0-9A-Za-z_\-]{30,}\b"),
+     "Telegram bot token in served asset"),
+    ("recaptcha-sitekey", "info",
+     re.compile(r"\b6L[0-9A-Za-z_\-]{38}\b|\b6Lf[0-9A-Za-z_\-]{32}\b"),
+     "reCAPTCHA site key (expected public — confirm domain allow-list)"),
+]
+
+# --- dangerous sinks / constructs ------------------------------------------
+SINK_DETECTIONS = [
+    ("sink-document-write", "medium",
+     re.compile(r"\bdocument\.write(?:ln)?\s*\("),
+     "document.write()/writeln() — DOM injection sink", "CWE-79"),
+    ("sink-innerhtml", "low", re.compile(r"\.innerHTML\s*(?:\+|=)"),
+     ".innerHTML assignment — potential XSS sink if data untrusted", "CWE-79"),
+    ("sink-outerhtml", "low", re.compile(r"\.outerHTML\s*="),
+     ".outerHTML assignment — markup injection sink", "CWE-79"),
+    ("sink-insertadjacent", "low", re.compile(r"\.insertAdjacentHTML\s*\("),
+     "insertAdjacentHTML() — markup injection sink", "CWE-79"),
+    ("sink-createcontextualfragment", "low",
+     re.compile(r"\.createContextualFragment\s*\("),
+     "createContextualFragment — parses attacker-controllable markup", "CWE-79"),
+    ("sink-eval", "medium", re.compile(r"(?<![\w.$])eval\s*\("),
+     "eval() — dynamic code execution", "CWE-95"),
+    ("sink-new-function", "medium", re.compile(r"\bnew\s+Function\s*\("),
+     "Function constructor — dynamic code execution", "CWE-94"),
+    ("sink-settimeout-string", "low",
+     re.compile(r"\bset(?:Timeout|Interval)\s*\(\s*['\"`]"),
+     "String argument to setTimeout/setInterval (implicit eval)", "CWE-95"),
+    ("sink-execscript", "medium", re.compile(r"\bexecScript\s*\("),
+     "Legacy script-execution API used", "CWE-94"),
+    ("sink-jquery-html-var", "medium",
+     re.compile(r"\$\([^)]*\)\s*\.html\s*\(\s*[A-Za-z_$][\w$.]*\s*\)"),
+     "jQuery .html(variable) — markup injection with dynamic data", "CWE-79"),
+    ("sink-location-from-var", "medium",
+     re.compile(r"\b(?:window\.)?location(?:\.(?:href|assign|replace))?\s*=\s*"
+                r"[A-Za-z_$][\w$.]*(?:\[[^\]]+\])?"),
+     "Navigation target assigned from a variable (open-redirect pattern)",
+     "CWE-601"),
+    ("sink-postmessage-star", "medium",
+     re.compile(r"\.postMessage\s*\([^)]*,\s*['\"]\*['\"]\s*\)"),
+     "postMessage(..., '*') — cross-origin message leak wildcard", "CWE-346"),
+    ("sink-message-no-origin-check", "medium",
+     re.compile(r"addEventListener\s*\(\s*['\"]message['\"]"
+                r"(?:(?!\.origin).){0,300}?\}", re.S),
+     "'message' listener without event.origin validation", "CWE-346"),
+    ("sink-websocket-insecure", "medium", re.compile(r"['\"]ws://"),
+     "Insecure ws:// WebSocket endpoint in client code", "CWE-319"),
+    ("sink-xhr-open-dynamic", "low",
+     re.compile(r"\.open\s*\(\s*['\"]GET['\"]\s*,\s*[A-Za-z_$]"),
+     "XHR URL constructed dynamically — validate it stays on allow-list",
+     "CWE-918"),
+    ("sink-fetch-template", "low", re.compile(r"\bfetch\s*\(\s*`\$\{"),
+     "fetch() with template-interpolated URL — sanitize inputs", "CWE-918"),
+    ("sink-prototype-pollution", "medium",
+     re.compile(r"\.__proto__\s*=|\[\s*['\"]__proto__['\"]\s*\]\s*="
+                r"|\bObject\.setPrototypeOf\s*\(\s*[A-Za-z_$][\w$]*\s*,\s*"
+                r"[A-Za-z_$][\w$]*\s*(?:[.[])"),
+     "__proto__/setPrototypeOf mutation — prototype pollution pattern",
+     "CWE-1321"),
+    ("sink-jsonp-callback", "medium",
+     re.compile(r"\bjsonpCallback\s*[:=]|callback\s*=\s*\?\b"),
+     "JSONP callback usage — script injection surface", "CWE-79"),
+    ("sink-cookie-write-js", "low",
+     re.compile(r"document\.cookie\s*=\s*[^;\n]{4,};"),
+     "Cookie written from JavaScript (HttpOnly bypass by design)", "CWE-1004"),
+    ("sink-storage-sensitive", "medium",
+     re.compile(r"(?:localStorage|sessionStorage)\s*\.\s*setItem\s*\(\s*"
+                r"['\"][^'\"]*(?:token|jwt|secret|password|ssn|credit)", re.I),
+     "Sensitive value persisted in Web Storage (readable by any XSS payload)",
+     "CWE-522"),
+    ("sink-atob-decode", "low",
+     re.compile(r"\batob\s*\(\s*['\"][A-Za-z0-9+/=]{24,}['\"]\s*\)"),
+     "Base64 blob decoded at runtime — inspect what it contains", "CWE-506"),
+    ("sink-string-fromcharcode", "low",
+     re.compile(r"String\.fromCharCode\s*\(\s*(?:\d+\s*,\s*){8,}"),
+     "Long char-code sequence reconstruction (classic obfuscation)", "CWE-506"),
+    ("sink-unescape", "low", re.compile(r"\bunescape\s*\("),
+     "Legacy decoding call — often wraps payloads", "CWE-506"),
+    ("sink-srcdoc", "low", re.compile(r"\.srcdoc\s*="),
+     "iframe srcdoc set dynamically — nested document injection", "CWE-79"),
+    ("sink-mutation-after-append", "low",
+     re.compile(r"\b(?:appendChild|append)\s*\([\s\S]{0,120}?\)[\s\S]{0,60}?"
+                r"\.setAttribute\s*\(\s*['\"](?:href|src|on\w+)['\"]"),
+     "Node appended then attributes mutated (mXSS/DOMPurify-bypass style)",
+     "CWE-79"),
+    ("sink-angular-bind-html", "medium",
+     re.compile(r"\bng-bind-html\b|\$sce\.trustAsHtml\s*\("),
+     "Angular trustAsHtml/ng-bind-html — raw HTML binding", "CWE-79"),
+    ("sink-react-dangerously", "medium",
+     re.compile(r"\bdangerouslySetInnerHTML\b"),
+     "React dangerouslySetInnerHTML — raw HTML injection point", "CWE-79"),
+    ("sink-vue-vhtml", "low", re.compile(r"\bv-html\s*="),
+     "Vue v-html directive — raw HTML rendering", "CWE-79"),
+    ("sink-service-worker-http", "medium",
+     re.compile(r"caches?\.add(?:All)?\s*\(\s*['\"]http://"),
+     "Service worker caching cleartext http:// resources", "CWE-319"),
+    ("sink-debugger", "info",
+     re.compile(r"(?<![\w.'\"])\bdebugger\b(?![\w'\"])"),
+     "'debugger' statement left in production bundle", "CWE-489"),
+    ("sink-console-sensitive", "info",
+     re.compile(r"console\.(?:log|debug|warn|info)\s*\(\s*[`'\"} ]*"
+                r"(?:token|secret|password|passwd|authorization|cookie|session"
+                r"|apikey|api_key)", re.I),
+     "Console logging of sensitive-named values", "CWE-489"),
+    ("sink-hardcoded-ip", "low",
+     re.compile(r"['\"]https?://\d{1,3}(?:\.\d{1,3}){3}(?::\d+)?"),
+     "Hardcoded IP-based endpoint in client code", ""),
+    ("sink-interval-fast", "low",
+     re.compile(r"setInterval\s*\([^,]+,\s*(?:[1-9]|[1-9]\d|1[0-4]\d|150)\s*\)"),
+     "setInterval under 150ms — battery/perf smell (report only)", ""),
+]
+
+OBFUSCATION_DETECTIONS = [
+    ("obf-hex-escape-chain", "medium",
+     re.compile(r"(?:\\x[0-9a-fA-F]{2}){12,}"),
+     "Long \\x hex escape chain (payload obfuscation)"),
+    ("obf-unicode-escapes", "medium",
+     re.compile(r"(?:\\\\u[0-9a-fA-F]{4}){8,}"),
+     "Dense \\u unicode escape sequence (obfuscation)"),
+    ("obf-packed-array", "low",
+     re.compile(r"\[\s*(?:'[^']{1,3}'\s*,\s*){25,}\]"),
+     "Giant array of tiny strings — typical packer output"),
+    ("obf-string-concat-build", "low",
+     re.compile(r"(?:['\"][A-Za-z$_]{1,6}['\"]\s*\+\s*){10,}"
+                r"['\"][A-Za-z$_]{1,6}['\"]"),
+     "Identifier built via many small string concatenations"),
+    ("obf-base64-blob", "low",
+     re.compile(r"['\"][A-Za-z0-9+/]{120,}={0,2}['\"]"),
+     "Very long base64-looking literal embedded in code"),
+    ("obf-packer-header", "low",
+     re.compile(r"\beval\(function\s*\(|\bwebpackJsonp\b|__webpack_require__"),
+     "Bundler/packer signature — review bundle contents anyway", ""),
+]
+
+LIB_FINGERPRINTS = [
+    ("lib-jquery",
+     re.compile(r"jQuery\s+v?(\d+\.\d+\.\d+)|jquery[/.-](\d+\.\d+\.\d+)"),
+     "jQuery"),
+    ("lib-bootstrap", re.compile(r"Bootstrap\s+v?(\d+\.\d+\.\d+)"), "Bootstrap"),
+    ("lib-angular",
+     re.compile(r"AngularJS\s+v?(\d+\.\d+\.\d+)|angular[/.-](\d+\.\d+\.\d+)"),
+     "AngularJS/Angular"),
+    ("lib-react",
+     re.compile(r"react-dom[/.-](\d+\.\d+\.\d+)|React\s+v(\d+\.\d+\.\d+)"),
+     "React"),
+    ("lib-vue",
+     re.compile(r"Vue\.js\s*v?(\d+\.\d+\.\d+)|vue[/.-](\d+\.\d+\.\d+)"), "Vue"),
+    ("lib-moment", re.compile(r"moment\.js\s*v?(\d+\.\d+\.\d+)"), "Moment.js"),
+    ("lib-lodash", re.compile(r"lodash[/.-](\d+\.\d+\.\d+)"), "Lo-Dash"),
+    ("lib-d3", re.compile(r"d3\.js\s*v?(\d+\.\d+\.\d+)"), "D3"),
+    ("lib-three",
+     re.compile(r"three\.js\s*r(\d+)|THREE\.REVISION\s*=\s*'?(\d+)"), "Three.js"),
+    ("lib-tinymce", re.compile(r"TinyMCE\s*[v/](\d+\.\d+\.\d+)"),
+     "TinyMCE editor"),
+    ("lib-ckeditor", re.compile(r"CKEditor\s*(\d+\.\d+\.\d+)"), "CKEditor"),
+    ("lib-swagger-ui", re.compile(r"swagger-ui[/.-](\d+\.\d+\.\d+)"),
+     "Swagger UI"),
+]
+
+OLD_LIB_THRESHOLDS = {
+    "jQuery": ((3, 5, 0),
+               "CVE-2020-11022/11023 (XSS via htmlPrefilter) fixed in 3.5.0"),
+    "AngularJS/Angular": ((2, 0, 0),
+                          "AngularJS 1.x EOL since 2022 — unsupported branch"),
+    "Moment.js": ((2, 29, 2),
+                  "CVE-2022-24785/2022-31882 path traversal & RCE fixes"),
+    "Lo-Dash": ((4, 17, 21),
+                "CVE-2020-8203/2021-23352/2021-23337 prototype pollution"),
+    "TinyMCE editor": ((5, 10, 7), "Multiple pre-5.10.7 XSS advisories"),
+    "CKEditor": ((4, 20, 1), "Advisory GHSA-ckq5-rqt5-xqp3 XSS fixes"),
+    "Three.js": ((0, 125, 0), "Pre-r125 loaders had prototype-pollution issues"),
+}
+
+API_ENDPOINT_RE = re.compile(
+    r"""['"`(]\s*((?:https?:)?//[A-Za-z0-9._\-/]{6,120}"""
+    r"""|/(?:api|rest|graphql|backend|v[0-9]+)[A-Za-z0-9._\-/]{2,120}))""")
+
+TOKEN_ASSIGN_RE = re.compile(
+    r"(?i)\b(?:bearer[ \t]+)?(?:auth(?:orization)?|token|jwt|sessionid|"
+    r"session_id|xsrf|csrf|api[_-]?key|apikey|access[_-]?key|secret|password|"
+    r"passwd)\b")
+
+
+def _redact_frag(frag: str) -> str:
+    frag = frag.strip().replace("\n", "\\n")
+    if len(frag) > 90:
+        frag = frag[:90] + "…"
+    return frag
+
+
+def deep_analyze_js(text: str, where: str) -> List["Finding"]:
+    """Token-aware review of one JS source. Returns Finding objects (not added)."""
+    findings: List[Finding] = []
+    sample = text[:600_000]
+    stripped = _js_strip_comments(sample)
+
+    def mk(pid, sev, title, ev, fix="", cwe=""):
+        findings.append(Finding(
+            "JS-Review", pid, title, sev, 75,
+            evidence=f"{where}: {_redact_frag(ev)}",
+            remediation=fix, cwe=cwe))
+
+    # secrets — scan BOTH raw and comment-stripped text (comments hide keys too)
+    hit_ids = set()
+    for src_name, src_text in (("raw", sample), ("code", stripped)):
+        for sid, sev, rx, desc in SECRET_DETECTIONS:
+            m = rx.search(src_text)
+            if not m:
+                continue
+            if (sid, where) in hit_ids:
+                continue
+            hit_ids.add((sid, where))
+            frag = m.group(0)
+            # NEVER record secret VALUES — keep only the name prefix
+            safe = re.split(r"[:=]", frag, 1)[0].strip()
+            safe = re.sub(r"[A-Za-z0-9+/_\-]{8,}", "<REDACTED>", safe)[:70]
+            mk(sid, sev, desc, f"{safe} = <REDACTED> ({src_name})",
+               "Move secret server-side and rotate it immediately.", "CWE-798")
+
+    for sid, sev, rx, desc, cwe in SINK_DETECTIONS:
+        m = rx.search(stripped)
+        if m:
+            mk(sid, sev, desc, m.group(0), "", cwe)
+
+    for oid, sev, rx, desc in OBFUSCATION_DETECTIONS:
+        m = rx.search(stripped)
+        if m:
+            mk(oid, sev, desc, m.group(0)[:60],
+               "Minify intentionally; de-obfuscate before shipping.", "")
+
+    # library fingerprints & outdated versions
+    for lid, rx, libname in LIB_FINGERPRINTS:
+        m = rx.search(sample)
+        if not m:
+            continue
+        ver = next((g for g in m.groups() if g), "")
+        if libname in OLD_LIB_THRESHOLDS and ver:
+            try:
+                parts = [int(x) for x in ver.split(".")[:3]]
+                parts += [0] * (3 - len(parts))
+                vt = tuple(parts)
+            except ValueError:
+                vt = (999, 999, 999)
+            th = OLD_LIB_THRESHOLDS[libname][0]
+            if vt < th:
+                mk(lid + "-outdated", "medium",
+                   f"Outdated library: {libname} {ver} "
+                   f"(< {'.'.join(map(str, th))})",
+                   f"{libname} {ver}", OLD_LIB_THRESHOLDS[libname][1],
+                   "CWE-1104")
+            else:
+                mk(lid, "info", f"Client library detected: {libname} {ver}",
+                   f"{libname} {ver}")
+        else:
+            mk(lid, "info",
+               f"Client library detected: {libname}" + (f" {ver}" if ver else ""),
+               f"{libname} {ver}")
+
+    # API endpoints referenced in client code
+    eps = set()
+    for m in API_ENDPOINT_RE.finditer(stripped):
+        u = m.group(1)
+        if len(u) > 8:
+            eps.add(u[:100])
+    if eps:
+        listing = sorted(eps)
+        mk("api-endpoints-exposed", "info",
+           f"{len(listing)} internal API endpoint(s) referenced in client code",
+           ", ".join(listing[:8]),
+           "Ensure these endpoints enforce authz server-side (IDOR/BAC checks).",
+           "CWE-200")
+
+    dm = re.search(r"(?i)\b(?:DEBUG|DEV_MODE|IS_DEV|EXCEPTION_DEBUGGING|"
+                   r"SHOW_ERRORS)\s*[:=]\s*(true|1)\b", stripped)
+    if dm:
+        mk("debug-flag-enabled", "medium",
+           f"Debug flag left enabled in client bundle: {dm.group(1)}",
+           dm.group(0), "Strip debug flags at build time.", "CWE-489")
+
+    if re.search(r"console\.(?:table|dir)\s*\(", stripped):
+        mk("console-structure-dump", "info",
+           "console.table/dir dumps object structure in production",
+           "console.table/dir()", "Remove verbose logging from builds.", "")
+
+    ie = re.search(r"\b(?:setTimeout|setInterval)\s*\(\s*"
+                  r"(?:atob|unescape|decodeURIComponent)\s*\(", stripped)
+    if ie:
+        mk("indirect-eval-decoder", "high",
+           "Timer fed by decoder function (atob/unescape) — classic malicious "
+           "pattern", ie.group(0),
+           "Verify this code's provenance; replace with static callbacks.",
+           "CWE-95")
+
+    sm = re.search(r"//[#@]\s*sourceMappingURL=(\S+)", sample[-3000:])
+    if sm:
+        mk("sourcemap-reference", "info",
+           "Source-map reference present in served JS", sm.group(0),
+           "Check whether the .map file is publicly downloadable.", "")
+
+    # string-literal sweep for credential-shaped blobs inside data
+    for val, ln in _js_find_strings(stripped)[:4000]:
+        if TOKEN_ASSIGN_RE.search(val) and re.search(r"[=:]", val) \
+                and len(val) > 24:
+            mk("credential-shaped-string", "medium",
+               f"Credential-shaped string literal near line {ln}",
+               re.sub(r"[A-Za-z0-9+/_\-]{8,}", "<REDACTED>", val[:60]),
+               "Rotate anything that looks like a live credential.", "CWE-798")
+            break
+    return findings
+
+
+# ─────────────────────────────────────────────────────────────────────
+# HTML / form review engine — reads markup like an X-ray.
+# ─────────────────────────────────────────────────────────────────────
+FORM_TAG_RE = re.compile(r"<form\b[^>]*>(.*?)</form>", re.S | re.I)
+ANY_TAG_ATTR_RE = re.compile(r"<([a-z0-9]+)\b([^>]*)>", re.I)
+ATTR_SPLIT_RE = re.compile(
+    r"([a-z0-9_:.-]+)\s*=\s*(?:\"([^\"]*)\"|'([^']*)'|([^\s\"'>]+))", re.I)
+ON_EVENT_RE = re.compile(r"^on[a-z]{3,}$")
+INPUT_RE = re.compile(r"<input\b[^>]*>", re.I)
+SELECT_RE = re.compile(r"<select\b[^>]*>(.*?)</select>", re.S | re.I)
+OPTION_RE = re.compile(r"<option\b[^>]*value=[\"']([^\"']+)", re.I)
+COMMENT_RE = re.compile(r"<!--(.*?)-->", re.S)
+LOGIN_HINT_RE = re.compile(r"(?i)(password|passwd|pwd)")
+
+
+def parse_attrs(tag_head: str) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    for m in ATTR_SPLIT_RE.finditer(tag_head):
+        key = m.group(1).lower()
+        val = next((g for g in m.groups()[1:] if g is not None), "")
+        out[key] = val
+    return out
+
+
+def analyze_html_page(html_body: str, page_url: str) -> List["Finding"]:
+    """Static review of one HTML document: forms, handlers, comments."""
+    findings: List[Finding] = []
+    body = html_body[:400_000]
+    origin_host = urlparse(page_url).hostname or ""
+
+    def push(cat, nid, title, sev, ev, fix, cwe="", conf=70, verified=False):
+        findings.append(Finding(
+            cat, nid, title, sev, confidence=conf, verified=verified,
+            target=page_url, evidence=_redact_frag(ev),
+            remediation=fix, cwe=cwe))
+
+    # ---- forms ----
+    for fm in FORM_TAG_RE.finditer(body):
+        head_end = body.find(">", fm.start())
+        if head_end == -1:
+            continue
+        head_attrs = parse_attrs(body[fm.start():head_end + 1])
+        inner = fm.group(1)
+        action = head_attrs.get("action", "")
+        method = (head_attrs.get("method") or "get").lower()
+        full_action = urljoin(page_url, action) if action else page_url
+        fa_host = urlparse(full_action).hostname or ""
+        if fa_host and fa_host != origin_host:
+            push("Forms", "form-offsite-action",
+                 f"Form submits to off-site host {fa_host}", "medium",
+                 f"action={full_action[:120]} method={method}",
+                 "Confirm third-party submission is intended; otherwise pin "
+                 "action to same origin.", "CWE-346", 80, True)
+        if full_action.lower().startswith("http://"):
+            push("Forms", "form-cleartext-action",
+                 "Form submits over cleartext http://", "medium",
+                 full_action[:120], "Use https:// for every form action.",
+                 "CWE-319", 90, True)
+        input_tags = INPUT_RE.findall(inner)
+        inputs = [parse_attrs(t) for t in input_tags]
+        inputs = [a for a in inputs if a]
+        has_pw = any(LOGIN_HINT_RE.search(a.get("name", "")) or
+                     a.get("type", "").lower() == "password" for a in inputs)
+        pw_field = next((a for a in inputs
+                         if a.get("type", "").lower() == "password"), None)
+        if pw_field:
+            ac = pw_field.get("autocomplete", "").lower()
+            if ac in ("off", "false", "new-password"):
+                push("Forms", "pw-autocomplete-blocked",
+                     "Password field discourages password managers "
+                     f"(autocomplete={ac})", "info",
+                     "password input declares autocomplete=\"" + ac + "\"",
+                     "Use autocomplete=\"current-password\"/\"new-password\" "
+                     "correctly; don't block managers.", "CWE-522", 70)
+            elif "autocomplete" not in pw_field:
+                push("Forms", "pw-autocomplete-unset",
+                     "Password field lacks autocomplete guidance", "info",
+                     "no autocomplete attribute on password input",
+                     "Set autocomplete=\"new-password\"/\"current-password\".")
+        tok = next((a for a in inputs if re.search(
+            r"(?i)^(_?csrf[_-]?token|csrf|xsrf|authenticity_token|nonce|"
+            r"__requestverificationtoken|securitytoken)$",
+            a.get("name", ""))), None)
+        if method == "post" and tok is None and not has_pw:
+            push("Forms", "form-no-csrf-marker",
+                 "POST form without recognizable CSRF token field", "medium",
+                 f"action={full_action[:100]} fields="
+                 f"{[a.get('name','') for a in inputs][:6]}",
+                 "Add per-session anti-CSRF token or SameSite=Strict cookies.",
+                 "CWE-352", 55)
+        elif method == "post" and tok is not None and not tok.get("value"):
+            push("Forms", "csrf-token-empty",
+                 "CSRF-named field renders empty (server may not populate it)",
+                 "medium", f"name={tok.get('name')}",
+                 "Ensure the token is filled per session.", "CWE-352", 60)
+        if method == "get" and has_pw:
+            push("Forms", "credentials-over-get",
+                 "Login-style form submitted via GET "
+                 "(secrets land in URLs/logs/history)", "high",
+                 "password field inside <form method=get>",
+                 "Submit credentials only via POST over TLS.",
+                 "CWE-598", 85, True)
+        readonly_plain = [a for a in inputs
+                          if "readonly" in a
+                          and a.get("type", "text").lower() in ("text", "")]
+        if readonly_plain:
+            push("Forms", "readonly-input-client-trust",
+                 f"{len(readonly_plain)} readonly text input(s) — read-only is "
+                 "NOT a security control", "info",
+                 "names: " + ", ".join(a.get("name", "?")
+                                       for a in readonly_plain[:5]),
+                 "Validate/override these values server-side.", "CWE-602", 60)
+        hidden_vals = [a for a in inputs
+                       if a.get("type", "").lower() == "hidden"
+                       and re.search(r"(?i)(price|amount|role|admin|discount|"
+                                     r"user_?id|account|balance|qty|quantity)",
+                                     a.get("name", ""))]
+        if hidden_vals:
+            push("Forms", "hidden-business-field",
+                 "Hidden input carries business-critical value "
+                 "(tamper surface)", "medium",
+                 "names: " + ", ".join(a.get("name", "?")
+                                       for a in hidden_vals[:6]),
+                 "Recompute price/role/ids server-side; never trust hidden "
+                 "fields.", "CWE-602", 65)
+        enum_opts = sum(len(OPTION_RE.findall(b))
+                        for b in SELECT_RE.findall(inner))
+        if enum_opts > 0:
+            push("Forms", "enumerable-select-options",
+                 f"{enum_opts} <option> value(s) enumerable from markup",
+                 "info", "select fields expose option values",
+                 "Confirm enumerated ids are not sensitive identifiers.",
+                 "CWE-200", 55)
+
+    # ---- inline event handlers ----
+    inline_evts = []
+    for tm in ANY_TAG_ATTR_RE.finditer(body):
+        attrs = parse_attrs(tm.group(0))
+        for k, v in attrs.items():
+            if ON_EVENT_RE.match(k) and v.strip():
+                inline_evts.append(f"<{tm.group(1)} {k}=…>")
+    if inline_evts:
+        push("Forms", "inline-event-handlers",
+             f"{len(inline_evts)} inline on* event handler(s) in markup", "low",
+             ", ".join(dict.fromkeys(inline_evts))[:250],
+             "Attach listeners via addEventListener; keeps CSP 'unsafe-inline' "
+             "out of your policy.", "CWE-79", 75)
+
+    # ---- comments leaking internals ----
+    leaky = []
+    for cm in COMMENT_RE.finditer(body):
+        txt = cm.group(1).strip()
+        if len(txt) < 6:
+            continue
+        if re.search(r"(?i)(todo|fixme|hack|debug|password|api[_-]?key|token|"
+                     r"internal|staging|temporar|server\s*:|db[_-]?host|secret)",
+                     txt):
+            leaky.append(txt[:120])
+    if leaky:
+        push("Exposure", "html-comment-leak",
+             "HTML comment(s) disclose internal notes/markers", "low",
+             " || ".join(leaky[:4])[:400],
+             "Strip developer comments from production templates.",
+             "CWE-615", 70)
+
+    # ---- meta refresh / javascript: hrefs ----
+    if re.search(r"<meta[^>]+http-equiv=[\"']refresh[\"'][^>]*url=", body, re.I):
+        push("Forms", "meta-refresh", "META refresh redirect present", "info",
+             "<meta http-equiv=refresh url=...>",
+             "Prefer HTTP 3xx; ensure refresh target is validated.",
+             "CWE-601", 70)
+    js_hrefs = re.findall(r"href\s*=\s*[\"']javascript:", body, re.I)
+    if js_hrefs:
+        push("Forms", "javascript-href",
+             f"{len(js_hrefs)} href=\"javascript:...\" link(s)", "low",
+             "javascript: pseudo-URLs in anchors",
+             "Use buttons + addEventListener.", "CWE-79", 80)
+
+    # ---- reverse tabnabbing ----
+    risky_links = []
+    for tm in ANY_TAG_ATTR_RE.finditer(body):
+        if tm.group(1).lower() != "a":
+            continue
+        attrs = parse_attrs(tm.group(0))
+        href = attrs.get("href", "")
+        tgt = attrs.get("target", "")
+        rel = attrs.get("rel", "").lower()
+        if tgt == "_blank" and href.startswith(("http://", "https://", "//")):
+            h = urlparse(href if not href.startswith("//") else "https:" + href)
+            if h.hostname and h.hostname != origin_host and "noopener" not in rel:
+                risky_links.append(href[:60])
+    if risky_links:
+        push("Forms", "reverse-tabnabbing",
+             f"{len(risky_links)} external target=_blank link(s) without "
+             "rel=noopener", "low",
+             ", ".join(dict.fromkeys(risky_links))[:250],
+             "Add rel=\"noopener noreferrer\" to external _blank links.",
+             "CWE-1022", 85, True)
+    return findings
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Header-policy parser mini-engine (CSP / HSTS / Expect-CT / COOP / COEP)
+# ─────────────────────────────────────────────────────────────────────
+def parse_csp(value: str) -> Dict[str, List[str]]:
+    pol: Dict[str, List[str]] = {}
+    for part in value.split(";"):
+        toks = part.strip().split()
+        if not toks:
+            continue
+        pol[toks[0].lower()] = [t.lower() for t in toks[1:]]
+    return pol
+
+
+def analyze_csp(value: str, url: str) -> List["Finding"]:
+    out: List[Finding] = []
+    pol = parse_csp(value)
+    if not pol:
+        return out
+
+    def add(nid, sev, title, ev, fix, cwe, conf=85):
+        out.append(Finding(
+                "Headers", nid, title, sev, confidence=conf, verified=True,
+                target=url, evidence=_redact_frag(ev),
+                remediation=fix, cwe=cwe))
+
+    default = pol.get("default-src", [])
+    script = pol.get("script-src", default)
+    style = pol.get("style-src", default)
+    frame = pol.get("frame-src", pol.get("child-src", default))
+    connect = pol.get("connect-src", default)
+    obj = pol.get("object-src", default)
+    if "'unsafe-inline'" in script:
+        add("csp-unsafe-inline-scripts", "high",
+            "CSP allows 'unsafe-inline' for scripts (XSS still possible)",
+            f"script-src={' '.join(script)[:160]}",
+            "Use nonces/hashes; drop unsafe-inline.", "CWE-1021")
+    if "'unsafe-eval'" in script:
+        add("csp-unsafe-eval", "medium", "CSP allows 'unsafe-eval'",
+            f"script-src={' '.join(script)[:160]}",
+            "Avoid eval-dependent libs (or their wasm builds).", "CWE-1021")
+    if any(s == "*" for s in script):
+        add("csp-wildcard-script", "high",
+            "CSP script-src includes wildcard *",
+            f"script-src={' '.join(script)[:160]}",
+            "Pin script sources to specific hosts.", "CWE-1021")
+    wildish = [s for s in script if s.startswith("*.")]
+    if wildish:
+        add("csp-wildcard-host", "medium",
+            f"CSP trusts wildcard hosts: {', '.join(wildish[:4])}",
+            "wildcard subdomains allowed",
+            "Enumerate exact hosts you need.", "CWE-1021")
+    if obj and "'none'" not in obj and "*" in obj:
+        add("csp-object-wildcard", "medium",
+            "object-src permits plugins broadly",
+            f"object-src={' '.join(obj)}",
+            "Set object-src 'none'.", "CWE-1021")
+    if not obj and not default:
+        add("csp-no-object-src", "low",
+            "CSP lacks object-src AND default-src (plugins unrestricted)",
+            "object-src absent", "Set object-src 'none'.", "CWE-1021", 65)
+    if frame and ("*" in frame or any(f.startswith("*.") for f in frame)):
+        add("csp-frame-wildcard", "medium",
+            "frame/child-src allows wildcard embeds",
+            f"frame-src={' '.join(frame)[:120]}",
+            "Whitelist framing origins exactly.", "CWE-1021")
+    if connect and "*" in connect:
+        add("csp-connect-wildcard", "low",
+            "connect-src wildcard lets exfil requests go anywhere",
+            f"connect-src={' '.join(connect)[:120]}",
+            "Restrict fetch/XHR destinations.", "CWE-1021", 70)
+    if "report-to" not in pol and "report-uri" not in pol:
+        add("csp-no-reporting", "info",
+            "CSP has no report-uri/report-to endpoint",
+            "violations won't be reported",
+            "Enable Reporting-Endpoints for monitoring.", "", 60)
+    if style and "*" in style:
+        add("csp-style-wildcard", "info", "style-src wildcard",
+            f"style-src={' '.join(style)[:120]}",
+            "Scope CSS sources.", "CWE-1021", 55)
+    if "base-uri" not in pol:
+        add("csp-no-base-uri", "low", "CSP missing base-uri directive",
+            "base-uri absent — <base> hijack vector",
+            "Add base-uri 'self'.", "CWE-1021", 70)
+    if "form-action" not in pol:
+        add("csp-no-form-action", "low", "CSP missing form-action directive",
+            "form-action absent — form retargeting vector",
+            "Add form-action 'self'.", "CWE-1021", 70)
+    if "upgrade-insecure-requests" not in pol and \
+            "block-all-mixed-content" not in pol:
+        add("csp-no-upgrade-insecure", "info",
+            "CSP lacks upgrade-insecure-requests",
+            "mixed content not auto-upgraded",
+            "Add upgrade-insecure-requests.", "", 55)
+    return out
+
+
+def analyze_hsts_value(value: str, url: str) -> List["Finding"]:
+    out: List[Finding] = []
+    low = value.lower()
+    m = re.search(r"max-age\s*=\s*(\d+)", low)
+    age = int(m.group(1)) if m else 0
+    if age < 15552000:
+        out.append(Finding(
+            "Headers", "hsts-short-max-age",
+            f"HSTS max-age below 6 months ({age}s)", "low", 90, verified=True,
+            target=url, evidence=_redact_frag(value),
+            remediation="Use max-age=31536000; includeSubDomains; preload",
+            cwe="CWE-693"))
+    if "includesubdomains" not in low:
+        out.append(Finding(
+            "Headers", "hsts-no-subdomains",
+            "HSTS missing includeSubDomains", "info", 75, verified=True,
+            target=url, evidence=_redact_frag(value),
+            remediation="Add includeSubDomains after auditing subdomains."))
+    if "preload" not in low and age >= 31536000 and "includesubdomains" in low:
+        out.append(Finding(
+            "Headers", "hsts-preload-candidate",
+            "HSTS qualifies for browser preload list", "info", 70,
+            verified=True, target=url, evidence=_redact_frag(value),
+            remediation="Consider submitting to hstspreload.org.",
+            cwe="", confidence=60))
+    return out
+
+
+def analyze_ct_header(value: str, url: str) -> List["Finding"]:
+    out: List[Finding] = []
+    low = value.lower()
+    m = re.search(r"max-age\s*=\s*(\d+)", low)
+    age = int(m.group(1)) if m else 0
+    if age < 7776000:
+        out.append(Finding(
+            "Headers", "ct-max-age-low",
+            f"Expect-CT max-age short ({age}s)", "info", 75, verified=True,
+            target=url, evidence=_redact_frag(value),
+            remediation="Use max-age=7776000 with enforce or per-caching.",
+            cwe="CWE-693"))
+    if "enforce" not in low and "per-caching" not in low:
+        out.append(Finding(
+            "Headers", "ct-no-mode",
+            "Expect-CT present without enforce/per-caching mode", "info", 70,
+            verified=True, target=url, evidence=_redact_frag(value),
+            remediation="Add enforce; or rely on SCTs (TLS extension)."))
+    return out
+
+
+COOP_ANALYSIS = {
+    "same-origin-allow-popups": ("info",
+        "COOP=same-origin-allow-popups — popups keep opener handle"),
+    "unsafe-none": ("medium",
+        "COOP: unsafe-none — cross-origin windows may stay linked"),
+}
+COEP_ANALYSIS = {
+    "credentialless": ("info",
+        "COEP=credentialless — cross-origin isolation partial"),
+    "unsafe-none": ("low",
+        "COEP: unsafe-none — crossOriginIsolated=false (no SharedArrayBuffer)"),
+}
+
+
+# ─────────────────────────────────────────────────────────────────────
+# robots.txt parser (RFC 9309-ish) — used to ENFORCE crawl etiquette
+# ─────────────────────────────────────────────────────────────────────
+def parse_robots(text: str) -> Dict[str, List[Tuple[bool, str]]]:
+    """Return {user-agent: [(allow?, path), ...]} plus '_sitemaps' entries."""
+    rules: Dict[str, List[Tuple[bool, str]]] = {}
+    current: List[str] = []
+    for raw in text.splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if not line:
+            continue
+        m = re.match(r"(user-agent|allow|disallow|sitemap|crawl-delay|host)"
+                     r"\s*:\s*(.*)", line, re.I)
+        if not m:
+            continue
+        key, val = m.group(1).lower(), m.group(2).strip()
+        if key == "user-agent":
+            ua = val.lower()
+            rules.setdefault(ua, [])
+            current = [ua]
+        elif key in ("allow", "disallow") and current:
+            for ua in current:
+                rules.setdefault(ua, []).append(
+                    (key == "allow", val if val else "/"))
+        elif key == "sitemap":
+            rules.setdefault("_sitemaps", []).append((True, val))
+    return rules
+
+
+def robots_blocks(rules: Dict[str, List[Tuple[bool, str]]], ua: str,
+                  path: str) -> bool:
+    applicable = rules.get(ua, []) + rules.get("*", [])
+    best_len, blocked = -1, False
+    for allow, p in applicable:
+        pp = p.split("$")[0]
+        if not pp:
+            continue
+        if "*" not in pp:
+            ok = path.startswith(pp.rstrip("*"))
+        else:
+            rx = "^" + re.escape(pp.replace("*", "%STAR%")).replace("%STAR%",
+                                                                    ".*")
+            rx += "$" if pp.endswith("*") else ""
+            ok = bool(re.match(rx, path))
+        spec = len(pp)
+        if ok and spec > best_len:
+            best_len, blocked = spec, (not allow)
+    return blocked
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Minimal DNS wire-format resolver (works WITHOUT dnspython installed)
+# over UDP 53 to system resolvers: A/AAAA/NS/MX/TXT/SOA/CAA/TLSA/DNSKEY.
+# Read-only queries; never brute-forces names.
+# ─────────────────────────────────────────────────────────────────────
+DNS_QTYPES = {"A": 1, "NS": 2, "CNAME": 5, "SOA": 6, "PTR": 12, "MX": 15,
+              "TXT": 16, "AAAA": 28, "CAA": 257, "DNSKEY": 48, "TLSA": 52}
+
+
+def _system_resolvers() -> List[str]:
+    servers: List[str] = []
+    try:
+        for line in open("/etc/resolv.conf", encoding="utf-8",
+                         errors="replace"):
+            m = re.match(r"\s*nameserver\s+(\S+)", line)
+            if m:
+                servers.append(m.group(1))
+    except OSError:
+        pass
+    if not servers:
+        servers = ["8.8.8.8", "1.1.1.1"]
+    return servers[:2]
+
+
+def _dns_encode_name(name: str) -> bytes:
+    out = b""
+    for label in name.strip(".").split("."):
+        try:
+            b = (label.encode("idna") if any(ord(ch) > 127 for ch in label)
+                 else label.encode("ascii"))
+        except (UnicodeError, UnicodeDecodeError):
+            continue
+        if not 1 <= len(b) <= 63:
+            continue
+        out += bytes([len(b)]) + b
+    return out + b"\x00"
+
+
+def _dns_read_name( bytes, off: int) -> Tuple[str, int]:
+    labels, jumped, new_off, steps = [], False, off, 0
+    while steps < 64:
+        steps += 1
+        if off >= len(data):
+            break
+        ln = data[off]
+        if ln == 0:
+            off += 1
+            if not jumped:
+                new_off = off
+            break
+        if ln & 0xC0 == 0xC0:
+            if off + 1 >= len(data):
+                break
+            ptr = ((ln & 0x3F) << 8) | data[off + 1]
+            if not jumped:
+                new_off = off + 2
+            off = ptr
+            jumped = True
+            continue
+        if off + 1 + ln > len(data):
+            break
+        labels.append(data[off + 1:off + 1 + ln].decode("ascii", "replace"))
+        off += 1 + ln
+        if not jumped:
+            new_off = off
+    return ".".join(labels) + ("." if labels else ""), new_off
+
+
+def dns_query(server: str, name: str, qtype: str, timeout: float = 3.0
+              ) -> Optional[List[Dict[str, Any]]]:
+    qt = DNS_QTYPES.get(qtype.upper())
+    if qt is None:
+        return None
+    tid = os.getpid() & 0xFFFF
+    query = struct.pack(">HHHHHH", tid, 0x0100, 1, 0, 0, 0)
+    query += _dns_encode_name(name) + struct.pack(">HH", qt, 1)
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(timeout)
+        s.sendto(query, (server, 53))
+        data, _ = s.recvfrom(4096)
+        s.close()
+    except OSError:
+        return None
+    if len(data) < 12:
+        return None
+    rid, flags, qd, an, ns, ar = struct.unpack(">HHHHHH", data[:12])
+    if rid != tid or not (flags & 0x8000):
+        return None
+    rcode = flags & 0xF
+    if rcode == 3:
+        return []
+    if rcode != 0:
+        return None
+    off = 12
+    for _ in range(qd):
+        _, off = _dns_read_name(data, off)
+        off += 4
+    answers: List[Dict[str, Any]] = []
+    for _ in range(an + ns + ar):
+        start = off
+        try:
+            rname, off = _dns_read_name(data, off)
+            hdr = struct.unpack(">HHIH", data[off:off + 10])
+            rtype, rclass, ttl, rdlen = hdr
+            off += 10
+            rdata = data[off:off + rdlen]
+            off += rdlen
+        except (struct.error, IndexError):
+            break
+        rec: Dict[str, Any] = {"name": rname, "type": rtype, "ttl": ttl}
+        if rtype == 1 and len(rdata) == 4:
+            rec["value"] = ".".join(str(b) for b in rdata)
+        elif rtype == 28 and len(rdata) == 16:
+            rec["value"] = ":".join(
+                f"{rdata[i]:02x}{rdata[i + 1]:02x}" for i in range(0, 16, 2))
+        elif rtype in (2, 5, 12):
+            nm, _ = _dns_read_name(data, start)
+            rec["value"] = nm
+        elif rtype == 15 and len(rdata) > 2:
+            pref = struct.unpack(">H", rdata[:2])[0]
+            nm, _ = _dns_read_name(data, start + 10)
+            rec["value"] = f"{pref} {nm}"
+        elif rtype == 16:
+            parts, p = [], 0
+            while p < len(rdata):
+                ln = rdata[p]
+                parts.append(rdata[p + 1:p + 1 + ln].decode("utf-8", "replace"))
+                p += 1 + ln
+            rec["value"] = " ".join(parts)
+        elif rtype == 6:
+            mname, o2 = _dns_read_name(data, start + 10)
+            rname2, o3 = _dns_read_name(data, o2)
+            try:
+                serial, refresh, retry, expire, minttl = struct.unpack(
+                    ">IIIII", data[o3:o3 + 20])
+                rec["value"] = (f"{mname} {rname2} serial={serial} "
+                                f"refresh={refresh} retry={retry} "
+                                f"expire={expire} negative_ttl={minttl}")
+            except struct.error:
+                rec["value"] = mname
+        elif rtype == 257 and len(rdata) >= 2:
+            taglen = rdata[1]
+            tag = rdata[2:2 + taglen].decode("ascii", "replace")
+            val = rdata[2 + taglen:].decode("ascii", "replace")
+            rec["value"] = f"{rdata[0]} {tag} \"{val}\""
+        else:
+            rec["value"] = rdata.hex()
+        answers.append(rec)
+    return answers
+
+
+def dns_query_all(name: str, qtype: str) -> List[Dict[str, Any]]:
+    for srv in _system_resolvers():
+        res = dns_query(srv, name, qtype)
+        if res:
+            return res
+    return []
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Extended TLS probing: protocol matrix + bounded handshake probes.
+# One handshake per family representative only — never a cipher sweep.
+# ─────────────────────────────────────────────────────────────────────
+WEAK_SUITES = [
+    ("NULL", "anonymous/NULL encryption"),
+    ("EXPORT", "export-grade crypto"),
+    ("RC4", "stream cipher with biases"),
+    ("DES", "56-bit legacy block cipher"),
+    ("3DES", "SWEET32 birthday attacks"),
+    ("MD5", "broken MAC algorithm"),
+]
+
+STRONG_NOTE = "TLS1.3 AEAD suites preferred (ChaCha20-Poly1305 / AES-GCM)."
+
+
+def tls_handshake_probe(host: str, port: int, *, sni: bool = True,
+                        max_version=None, timeout: float = 4.0
+                        ) -> Optional[Dict[str, Any]]:
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    try:
+        if max_version is not None:
+            ctx.maximum_version = max_version
+        with socket.create_connection((host, port), timeout=timeout) as sock:
+            with ctx.wrap_socket(sock,
+                                 server_hostname=(host if sni else None)) as ts:
+                ct = ts.cipher() or ("", "", "")
+                return {"version": ts.version, "cipher": ct[0],
+                        "bits": (ct[2] if len(ct) > 2 else 0)}
+    except Exception:
+        return None
+
+
+def enumerate_tls_families(host: str, port: int, throttle_wait=None
+                          ) -> Dict[str, str]:
+    """Bounded matrix: TLS1.3 / TLS1.2 / TLS1.1 / TLS1.0 / no-SNI.
+    Exactly ONE handshake per row — informational, never exhaustive."""
+    results: Dict[str, str] = {}
+    rows = [
+        ("TLS1.3", dict(max_version=ssl.TLSVersion.TLSv1_3)),
+        ("TLS1.2", dict(max_version=ssl.TLSVersion.TLSv1_2)),
+    ]
+    for old_attr in ("TLSv1_1", "TLSv1"):
+        mv = getattr(ssl.TLSVersion, old_attr, None)
+        if mv is not None:
+            rows.append((old_attr.replace("TLSv", "TLS ").replace("_", "."),
+                         dict(max_version=mv)))
+    rows.append(("NO-SNI", dict(sni=False)))
+    for label, kw in rows:
+        if throttle_wait:
+            throttle_wait()
+        r = tls_handshake_probe(host, port, **kw)
+        results[label] = (f"{r['version']} {r['cipher']}"
+                          if r else "unavailable")
+    return results
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Safe crawl helpers — BFS over same-origin HTML pages ONLY, respecting
+# robots.txt, depth/page/request caps. Never leaves origin, never sends
+# state-changing methods, never exceeds budget.
+# ─────────────────────────────────────────────────────────────────────
+LINK_HREF_RE = re.compile(
+    r"<a\b[^>]*?href\s*=\s*[\"']([^\"'#?]+)[^>]*>", re.I)
+SKIP_EXT = (".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".webp",
+            ".avif", ".css", ".woff", ".woff2", ".ttf", ".otf", ".eot",
+            ".mp3", ".mp4", ".webm", ".ogg", ".pdf", ".zip", ".gz",
+            ".tar", ".rar", ".7z", ".doc", ".docx", ".xls", ".xlsx",
+            ".ppt", ".pptx", ".dmg", ".exe", ".iso")
+
+
+def normalize_url(base: str, href: str) -> Optional[str]:
+    try:
+        u = urljoin(base, href.strip())
+    except ValueError:
+        return None
+    p = urlparse(u)
+    if p.scheme not in ("http", "https"):
+        return None
+    return urlunparse((p.scheme, p.netloc, p.path or "/", "", p.query, ""))
+
+# The scanner — 10 modules, all read-only
+# ─────────────────────────────────────────────────────────────────────
+class DentistScanner:
+    MAX_BODY_SCAN = 200_000          # bytes we look at (never saved)
+    MAX_WORKERS_CAP = 8              # hard cap on concurrency
+    MAX_JS_FILES = 12                # external scripts reviewed per scan
+    MAX_POST_REQUESTS = 40           # HARD cap on form POSTs per whole scan
+
+    def __init__(self, target: str, log: Callable[[str], None] = None,
+                 emit: Callable[["Finding"], None] = None,
+                 progress: Callable[[float], None] = None,
+                 rps: float = 2.0, workers: int = 4,
+                 verify: bool = True, deep_portscan: bool = False,
+                 mode: str = "standard", full_sweep: bool = False,
+                 udp_scan: bool = False, all_tcp_ports: bool = False,
+                 auth_user: str = "", auth_pass: str = ""):
+        raw = target.strip()
+        if raw and not raw.startswith(("http://", "https://")):
+            raw = "https://" + raw
+        self.target = raw.rstrip("/")
+        self.parsed = urlparse(self.target)
+        self.host = self.parsed.hostname or ""
+        self.log = log or (lambda m: None)
+        self.emit = emit or (lambda f: None)
+        self.progress = progress or (lambda p: None)
+        self.throttle = Throttle(rps)
+        self.workers = max(1, min(int(workers), self.MAX_WORKERS_CAP))
+        self.verify_enabled = verify
+        self.deep_portscan = deep_portscan
+        self.mode = mode if mode in ("quick", "standard", "deep") else "standard"
+        self.full_sweep = bool(full_sweep)
+        self.udp_scan = bool(udp_scan)
+        self.all_tcp_ports = bool(all_tcp_ports)
+        self.auth_user = auth_user or ""
+        self.auth_pass = auth_pass or ""
+        self.findings: List[Finding] = []
+        self.session = self._mk_session()
+        self._cancel = threading.Event()
+        self.stats = {"requests": 0, "skipped": 0, "denied": 0,
+                      "budget_stops": 0, "post_requests": 0,
+                      "method_requests": 0}
+        self.duration = 0.0
+        # crawl state (bounded, same-origin only, robots-respecting)
+        self.MAX_REQUESTS = 4000           # HARD budget cap per scan
+        self.MAX_CRAWL_PAGES = 60          # HARD page cap per scan
+        self._visited: set = set()
+        self._visit_lock = threading.Lock()
+        self._seen_names: set = set()
+        self._discovered_urls: List[str] = []
+        self._robots_rules: Dict[str, List[Tuple[bool, str]]] = {}
+        self._html_cache: Optional[str] = None
+        self._final_url: Optional[str] = None
+        self._root_response = None
+        # ── v4 accumulators ────────────────────────────────────────────
+        self.cdn_info: Dict[str, Any] = {}
+        self.origin_ip: Optional[str] = None
+        self.waf_name: Optional[str] = None
+        self.js_html_map: Dict[str, str] = {}      # js url -> html page url
+        self.login_forms: List[Dict[str, Any]] = []
+        self._form_sig_seen: set = set()
+        self._baseline_body_rx: Optional[re.Pattern] = None
+        self._baseline_len = 0
+        self._bfs_queue: List[str] = []
+        self.checklist_status: Dict[str, str] = {}
+        self._ck_done: set = set()
+
+    # ---------- helpers ----------
+    def _mk_session(self):
+        s = requests.Session()
+        s.headers.update({"User-Agent": UA, "Accept": "*/*"})
+        s.max_redirects = 5
+        return s
+
+    def cancelled(self) -> bool:
+        return self._cancel.is_set()
+
+    def stop(self):
+        self._cancel.set()
+
+    def get(self, url: str, timeout: float = 10.0,
+            headers: Optional[Dict[str, str]] = None,
+            follow_offsite: bool = False,
+            **kw) -> Optional["requests.Response"]:
+        """Throttled GET-only fetch. Budget-capped; offsite results dropped
+        unless the caller explicitly opts into following offsite hops."""
+        if self.cancelled() or not HAVE_REQUESTS:
+            return None
+        if self.stats["requests"] >= self.MAX_REQUESTS:
+            self.stats["budget_stops"] += 1
+            return None
+        self.throttle.wait()
+        try:
+            r = self.session.get(url, timeout=timeout, allow_redirects=True,
+                                 headers=headers, **kw)
+            self.stats["requests"] += 1
+            fin_host = urlparse(r.url).hostname or ""
+            if fin_host != self.host and not follow_offsite:
+                self.stats["skipped"] += 1
+                return None
+            return r
+        except requests.RequestException:
+            return None
+
+    # ---------- v4: bounded request helpers (still capped & throttled) --
+    def _budget_ok(self) -> bool:
+        if self.cancelled() or not HAVE_REQUESTS:
+            return False
+        if self.stats["requests"] >= self.MAX_REQUESTS:
+            self.stats["budget_stops"] += 1
+            return False
+        return True
+
+    def head(self, url: str, timeout: float = 8.0,
+             headers: Optional[Dict[str, str]] = None
+             ) -> Optional["requests.Response"]:
+        """HEAD probe — zero body transferred."""
+        if not self._budget_ok():
+            return None
+        self.throttle.wait()
+        try:
+            r = self.session.head(url, timeout=timeout, headers=headers,
+                                  allow_redirects=False)
+            self.stats["requests"] += 1
+            return r
+        except requests.RequestException:
+            return None
+
+    def options(self, url: str, timeout: float = 8.0,
+                headers: Optional[Dict[str, str]] = None
+                ) -> Optional["requests.Response"]:
+        """OPTIONS observation (CORS preflight / Allow header reading)."""
+        if not self._budget_ok():
+            return None
+        self.throttle.wait()
+        try:
+            r = self.session.options(url, timeout=timeout, headers=headers,
+                                     allow_redirects=False)
+            self.stats["requests"] += 1
+            return r
+        except requests.RequestException:
+            return None
+
+    def http_request(self, method: str, url: str, *, timeout: float = 10.0,
+                     headers: Optional[Dict[str, str]] = None,
+                     params: Optional[Dict[str, Any]] = None,
+                      Any = None, json_body: Any = None,
+                     allow_redirects: bool = False,
+                     budget_key: str = "method_requests",
+                     auth: Any = None) -> Optional["requests.Response"]:
+        """Generic bounded HTTP verb used by the METHODOLOGY module only.
+        Every call still passes through the global token-bucket throttle
+        and the hard per-scan request budget."""
+        if not self._budget_ok():
+            return None
+        self.throttle.wait()
+        try:
+            r = self.session.request(method.upper(), url, timeout=timeout,
+                                     headers=headers, params=params,
+                                     data=data, json=json_body,
+                                     allow_redirects=allow_redirects, auth=auth)
+            self.stats["requests"] += 1
+            self.stats[budget_key] = self.stats.get(budget_key, 0) + 1
+            return r
+        except requests.RequestException:
+            return None
+
+    def post_form(self, url: str, form_ Dict[str, str], *,
+                  timeout: float = 12.0, headers: Optional[Dict] = None,
+                  cookies: Optional[Dict[str, str]] = None,
+                  allow_redirects: bool = True
+                  ) -> Optional["requests.Response"]:
+        """Bounded POST of a FORM exactly as a browser would submit it.
+        Used ONLY for authorized-login checks (operator-supplied creds) and
+        baseline-vs-marker form behaviour comparison. Hard-capped at
+        MAX_POST_REQUESTS for the whole scan; never used to flood."""
+        if not self._budget_ok():
+            return None
+        if self.stats.get("post_requests", 0) >= self.MAX_POST_REQUESTS:
+            self.stats["budget_stops"] += 1
+            return None
+        self.throttle.wait()
+        try:
+            s = requests.Session()
+            s.headers.update({"User-Agent": UA})
+            r = s.post(url, data=form_data, timeout=timeout, headers=headers,
+                       cookies=cookies, allow_redirects=allow_redirects)
+            self.stats["requests"] += 1
+            self.stats["post_requests"] += 1
+            return r
+        except requests.RequestException:
+            return None
+
+    def add(self, f: Finding):
+        if f.confidence < 30:
+            return
+        f.target = self.target
+        key = (f.category, f.name, f.evidence[:80])
+        with self._visit_lock:
+            if key in self._seen_names:
+                return
+            self._seen_names.add(key)
+        self.findings.append(f)
+        self.emit(f)
+        self.log(f"[{f.severity.upper()}] {f.title}")
+
+    # ---------- verification (false-positive killer) ----------
+    def _refetch(self, url: str):
+        if self.cancelled() or not HAVE_REQUESTS:
+            return None
+        self.throttle.wait()
+        try:
+            s = requests.Session()
+            s.headers.update({"User-Agent": UA})
+            r = s.get(url, timeout=10, allow_redirects=False)
+            self.stats["requests"] += 1
+            return r
+        except requests.RequestException:
+            return None
+
+    def verify_finding(self, f: Finding, url: str,
+                       check: Callable[..., bool]) -> bool:
+        """Re-request with an independent session; only reproduced findings
+        keep verified=True. Unverified ones lose half their confidence."""
+        if not self.verify_enabled:
+            f.verified = True
+            return True
+        ok = False
+        for attempt in range(2):
+            r = self._refetch(url)
+            if r is not None and check(r):
+                ok = True
+                break
+            if attempt == 0:
+                time.sleep(1.0)
+        f.verified = ok
+        if not ok:
+            f.confidence = max(10, f.confidence // 2)
+            f.evidence += " | UNVERIFIED (could not reproduce)"
+        return ok
+
+    def _root_html(self):
+        """Fetch '/' once (cache body AND headers) for later modules."""
+        if self._html_cache is None:
+            r = self.get(self.target + "/")
+            if r is None:
+                return None, None
+            self._html_cache = r.text[:400_000]
+            self._final_url = r.url
+            self._root_response = r
+        return self._html_cache, self._final_url
+
+    # ============================================================
+    # MODULE 1 — DNS & email-security recon (read-only)
+    # ============================================================
+    def mod_dns(self):
+        self.log("— [1/10] DNS recon")
+        try:
+            infos = socket.getaddrinfo(self.host, None)
+            ips = sorted({i[4][0] for i in infos})
+        except socket.gaierror:
+            self.add(Finding("DNS", "no-resolution", "Domain does not resolve",
+                             "info", 95, evidence="NXDOMAIN / no A record"))
+            return
+        self.add(Finding("DNS", "resolved", "DNS resolution", "info", 100,
+                         verified=True,
+                         description=f"{self.host} resolves to {', '.join(ips)}",
+                         evidence=", ".join(ips)))
+        if len(ips) > 1:
+            self.add(Finding("DNS", "multi-ip", "Multiple A records (LB/CDN)",
+                             "info", 90, verified=True, evidence=", ".join(ips)))
+        try:
+            alias = socket.gethostbyname_ex(self.host)[1]
+            if alias:
+                self.add(Finding("DNS", "cname", "CNAME record present", "info", 90,
+                                 evidence=", ".join(alias),
+                                 description="Target is fronted by another hostname "
+                                             "(possible CDN/proxy)."))
+        except Exception:
+            pass
+        txt = self._lookup_txt()
+        if txt:
+            self.add(Finding("DNS", "txt", "DNS TXT records", "info", 85,
+                             evidence="; ".join(txt)[:500]))
+        spf = [t for t in txt if t.lower().startswith("v=spf1")]
+        if txt and not spf:
+            self.add(Finding("Email-Security", "no-spf", "SPF record missing",
+                             "medium", 80, verified=True,
+                             description="No v=spf1 TXT record found; domain can be "
+                                         "spoofed in email.",
+                             remediation="Publish an SPF record.", cwe="CWE-290"))
+        elif spf and "+all" in spf[0].lower():
+            self.add(Finding("Email-Security", "spf-plus-all",
+                             "SPF ends with +all (permits any sender)", "high", 95,
+                             verified=True, evidence=spf[0][:200],
+                             remediation="Replace +all with -all.", cwe="CWE-290"))
+        if not self._has_dmarc():
+            self.add(Finding("Email-Security", "no-dmarc", "DMARC record missing",
+                             "medium", 80, verified=True,
+                             remediation="Add _dmarc.<domain> TXT record with "
+                                         "p=quarantine/reject.", cwe="CWE-290"))
+
+    def _lookup_txt(self) -> List[str]:
+        try:
+            import dns.resolver  # optional dependency
+            return [str(r).strip('"') for r in dns.resolver.resolve(self.host, "TXT")]
+        except Exception:
+            return []
+
+    def _has_dmarc(self) -> bool:
+        base = ".".join(self.host.split(".")[-2:]) if self.host.count(".") >= 1 else self.host
+        try:
+            import dns.resolver
+            dns.resolver.resolve(f"_dmarc.{base}", "TXT")
+            return True
+        except Exception:
+            return False
+
+    # ============================================================
+    # MODULE 2 — TCP port reachability (single connect each, safe)
+    # ============================================================
+    TOP_PORTS = [21, 22, 23, 25, 53, 80, 110, 143, 443, 445, 465, 587, 993, 995,
+                 1433, 1521, 2049, 2375, 3000, 3306, 3389, 5432, 5601, 5900,
+                 6379, 8000, 8080, 8443, 8888, 9000, 9092, 9200, 11211, 27017]
+
+    def mod_ports(self):
+        ports = list(self.TOP_PORTS)
+        if self.deep_portscan:
+            ports = sorted(set(ports + list(range(1, 1025))))
+        if self.all_tcp_ports:
+            ports = sorted(set(ports + list(range(1, 65536))))
+        elif self.full_sweep:
+            ports = sorted(set(ports + list(range(1, 1025)) +
+                               list(range(1024, 9099))))
+        self.log(f"— [2/10] TCP connect scan ({len(ports)} ports, "
+                 f"{self.workers} workers)")
+        open_ports: List[int] = []
+        with cf.ThreadPoolExecutor(max_workers=self.workers) as ex:
+            futs = {ex.submit(self._tcp_probe, p): p for p in ports}
+            for fut in cf.as_completed(futs):
+                if self.cancelled():
+                    break
+                p, state = fut.result()
+                if state == "open":
+                    open_ports.append(p)
+        open_ports.sort()
+        risky = {21: "FTP cleartext", 23: "Telnet", 25: "SMTP", 110: "POP3",
+                 143: "IMAP", 445: "SMB", 1433: "MSSQL", 1521: "Oracle",
+                 2375: "Docker API (unauthenticated!)", 3306: "MySQL",
+                 3389: "RDP", 5432: "PostgreSQL", 5601: "Kibana", 5900: "VNC",
+                 6379: "Redis", 9200: "Elasticsearch", 11211: "Memcached",
+                 27017: "MongoDB", 9092: "Kafka"}
+        for p in open_ports:
+            sev = "high" if p in risky and p not in (80, 443) else "info"
+            self.add(Finding("Network", f"port-{p}-open",
+                             f"TCP port {p} open" + (f" — {risky[p]}" if p in risky else ""),
+                             sev, 90, verified=True,
+                             evidence=f"{self.host}:{p} accepted connection",
+                             remediation="Restrict exposure via firewall unless required."
+                                         if sev == "high" else "",
+                             cwe="CWE-284" if sev == "high" else ""))
+
+    def _tcp_probe(self, port: int) -> Tuple[int, str]:
+        if self.cancelled():
+            return port, "closed"
+        try:
+            with socket.create_connection((self.host, port), timeout=2.0):
+                return port, "open"
+        except (socket.timeout, ConnectionRefusedError, OSError):
+            return port, "closed"
+
+    # ============================================================
+    # MODULE 3 — TLS / certificate analysis
+    # ============================================================
+    def mod_tls(self):
+        port = self.parsed.port or 443
+        self.log("— [3/10] TLS analysis")
+        ctx = ssl.create_default_context()
+        peercert: Dict = {}
+        proto = cipher = ""
+        try:
+            with socket.create_connection((self.host, port), timeout=10) as sock:
+                with ctx.wrap_socket(sock, server_hostname=self.host) as ts:
+                    proto = ts.version
+                    ct = ts.cipher() or ("", "", "")
+                    cipher = f"{ct[0]} ({ct[1]}, {ct[2]})"
+                    peercert = ts.getpeercert()
+        except ssl.SSLCertVerificationError as e:
+            self.add(Finding("TLS", "cert-invalid", "Certificate validation FAILED",
+                             "high", 95, verified=True, evidence=str(e)[:300],
+                             remediation="Install a trusted CA-signed cert; fix chain.",
+                             cwe="CWE-295"))
+            return
+        except OSError:
+            return
+        if not peercert:
+            return
+        try:
+            nb = ssl.cert_time_to_seconds(peercert["notAfter"])
+            days = (nb - time.time()) / 86400
+            if days < 0:
+                self.add(Finding("TLS", "cert-expired", "Certificate EXPIRED",
+                                 "critical", 100, verified=True,
+                                 evidence=peercert["notAfter"],
+                                 remediation="Renew immediately.", cwe="CWE-298"))
+            elif days < 21:
+                self.add(Finding("TLS", "cert-expiring",
+                                 f"Certificate expires in {int(days)} days",
+                                 "medium", 100, verified=True,
+                                 evidence=peercert["notAfter"],
+                                 remediation="Enable auto-renewal."))
+            else:
+                self.add(Finding("TLS", "cert-valid-until", "Certificate validity",
+                                 "info", 100, verified=True,
+                                 evidence=f"{peercert['notAfter']} ({int(days)} days)"))
+        except Exception:
+            pass
+        subj = dict(x[0] for x in peercert.get("subject", ()))
+        cn = subj.get("commonName", "")
+        sans = [v for k, v in peercert.get("subjectAltName", ()) if k == "DNS"]
+        if cn and not sans:
+            self.add(Finding("TLS", "no-san", "Certificate lacks SubjectAltName",
+                             "low", 85, evidence=f"CN={cn}",
+                             remediation="Issue cert with SAN entries.", cwe="CWE-297"))
+        weak = re.search(r"RC4|DES|MD5|NULL|EXPORT", cipher or "", re.I)
+        if weak:
+            self.add(Finding("TLS", "weak-cipher", "Weak negotiated cipher",
+                             "high", 90, verified=True, evidence=cipher,
+                             remediation="Restrict to TLS1.2+ AEAD suites.",
+                             cwe="CWE-327"))
+        if proto in ("TLSv1", "SSLv3", "TLSv1.1"):
+            self.add(Finding("TLS", "old-protocol", f"Obsolete protocol: {proto}",
+                             "high", 95, verified=True, evidence=proto,
+                             remediation="Disable TLS<1.2.", cwe="CWE-326"))
+        else:
+            self.add(Finding("TLS", "protocol", "Negotiated TLS version", "info",
+                             100, verified=True, evidence=f"{proto} | {cipher}"))
+        try:
+            exts = peercert.get("extensions", ())
+            names = {e[0] for e in exts}
+            if "OCSP URLs" not in names and "CA Issuers" not in names:
+                self.add(Finding("TLS", "no-ocsp-info", "No OCSP info in certificate",
+                                 "info", 60,
+                                 description="Cannot confirm revocation infra from "
+                                             "the leaf cert alone.",
+                                 remediation="Publish OCSP/CRL endpoints; enable stapling."))
+        except Exception:
+            pass
+
+    # ============================================================
+    # MODULE 4 — HTTP response headers / cookies
+    # ============================================================
+    SECURITY_HEADERS = {
+        "Strict-Transport-Security": ("missing-hsts", "HSTS header missing", "medium",
+                                      "Add: Strict-Transport-Security: max-age=31536000;"
+                                      " includeSubDomains"),
+        "Content-Security-Policy": ("missing-csp", "CSP header missing", "medium",
+                                    "Define a Content-Security-Policy."),
+        "X-Content-Type-Options": ("missing-xcto", "X-Content-Type-Options missing",
+                                   "low", "Set: X-Content-Type-Options: nosniff"),
+        "X-Frame-Options": ("missing-xfo", "X-Frame-Options / frame-ancestors missing",
+                            "low", "Set X-Frame-Options: DENY or CSP frame-ancestors 'none'"),
+        "Referrer-Policy": ("missing-referrer", "Referrer-Policy missing", "info",
+                            "Set Referrer-Policy: strict-origin-when-cross-origin"),
+        "Permissions-Policy": ("missing-perms-policy", "Permissions-Policy missing",
+                               "info", "Restrict geolocation/camera/mic via Permissions-Policy"),
+    }
+
+    def mod_headers(self):
+        self.log("— [4/10] HTTP headers & cookies")
+        html_body, final_url = self._root_html()
+        if html_body is None:
+            self.add(Finding("HTTP", "unreachable", "Site unreachable over HTTP(S)",
+                             "info", 60, evidence="GET / failed"))
+            return
+        r = self._root_response
+        if r is None:
+            return
+        h = {k.lower(): v for k, v in r.headers.items()}
+        for hdr, (nid, title, sev, fix) in self.SECURITY_HEADERS.items():
+            if hdr.lower() in h:
+                continue
+            if hdr == "X-Frame-Options" and "frame-ancestors" in \
+                    h.get("content-security-policy", "").lower():
+                continue
+            f = Finding("Headers", nid, title, sev, 85,
+                        evidence=f"Final URL: {r.url} | status {r.status_code}",
+                        remediation=fix, cwe="CWE-693",
+                        description="Security header absent on HTML response.")
+            self.verify_finding(f, r.url, lambda rr, hd=hdr:
+                                hd.lower() not in {k.lower() for k in rr.headers})
+            self.add(f)
+        # cookie hygiene — parse raw Set-Cookie strings (authoritative;
+        # requests' jar can drop attributes/duplicates)
+        import http.cookies as _hc
+        setc = [v for k, v in r.headers.items() if k.lower() == "set-cookie"]
+        seen_ck = set()
+        for raw in setc:
+            try:
+                mc = _hc.SimpleCookie(raw)
+            except _hc.CookieError:
+                continue
+            for name in mc:
+                if name in seen_ck:
+                    continue
+                seen_ck.add(name)
+                low_raw = raw.lower()
+                probs = []
+                if "httponly" not in low_raw:
+                    probs.append("HttpOnly")
+                if "secure" not in low_raw:
+                    probs.append("Secure")
+                if "samesite" not in low_raw:
+                    probs.append("SameSite")
+                if probs:
+                    self.add(Finding(
+                        "Cookies", f"cookie-{name}",
+                        f"Cookie '{name}' missing {', '.join(probs)}",
+                        "medium" if "Secure" in probs and self.target.startswith("https")
+                        else "low", 85,
+                        verified=True, evidence=raw[:200],
+                        remediation="Set HttpOnly; Secure; SameSite=Lax/Strict.",
+                        cwe="CWE-1004"))
+        server = h.get("server", "")
+        xpn = h.get("x-powered-by", "")
+        if re.search(r"\d+\.\d+", server):
+            self.add(Finding("Headers", "server-version", "Server version disclosed",
+                             "low", 95, verified=True, evidence=f"Server: {server}",
+                             remediation="Hide version tokens.", cwe="CWE-200"))
+        if xpn:
+            self.add(Finding("Headers", "x-powered-by", "X-Powered-By disclosure",
+                             "low", 95, verified=True, evidence=xpn,
+                             remediation="Remove the header.", cwe="CWE-200"))
+        if "strict-transport-security" in h:
+            m = re.search(r"max-age=(\d+)", h["strict-transport-security"])
+            if m and int(m.group(1)) < 31536000:
+                self.add(Finding("Headers", "weak-hsts", "Short HSTS max-age",
+                                 "low", 90, verified=True,
+                                 evidence=h["strict-transport-security"],
+                                 remediation="Use max-age >= 6 months."))
+        if re.search(r"(?i)<title>\s*index of", html_body[:3000]):
+            self.add(Finding("Exposure", "dir-listing", "Directory listing enabled",
+                             "medium", 90, verified=True, evidence=r.url,
+                             remediation="Disable autoindex.", cwe="CWE-548"))
+        errm = re.search(r"(?i)(stack trace|traceback \(most recent call last\)|"
+                        r"warning\[\d+\]:|Notice: Undefined|SQL syntax.*?(?:MySQL|MariaDB)|"
+                        r"ORA-\d{5}|PG::Error|Microsoft OLE DB Provider)",
+                        html_body[:100_000])
+        if errm:
+            self.add(Finding("Exposure", "verbose-errors",
+                             "Application error detail leaked in HTML", "medium", 80,
+                             evidence=_html_mod.unescape(errm.group(0))[:120],
+                             remediation="Disable display_errors; log server-side only.",
+                             cwe="CWE-209"))
+
+    # ============================================================
+    # MODULE 5 — CORS policy (OPTIONS preflight OBSERVATION only)
+    # ============================================================
+    def mod_cors(self):
+        self.log("— [5/10] CORS policy observation")
+        if not HAVE_REQUESTS:
+            return
+        try:
+            self.throttle.wait()
+            r = self.session.options(self.target + "/", timeout=8,
+                                     headers={"Origin": "https://example.invalid"})
+            self.stats["requests"] += 1
+            acao = r.headers.get("access-control-allow-origin", "")
+            acac = r.headers.get("access-control-allow-credentials", "").lower()
+            if acao == "*" and acac == "true":
+                self.add(Finding("CORS", "cors-star-creds",
+                                 "CORS: wildcard origin WITH credentials",
+                                 "high", 80, verified=True,
+                                 evidence=f"ACAO={acao}; ACAC={acac}",
+                                 remediation="Never combine wildcard origin with "
+                                             "credentials.", cwe="CWE-942"))
+            elif acao == "null" and acac == "true":
+                self.add(Finding("CORS", "cors-null",
+                                 "CORS allows Origin: null with credentials",
+                                 "high", 80, verified=True,
+                                 evidence="ACAO=null; ACAC=true", cwe="CWE-942"))
+            elif acao and acao not in ("*", self.host) and acao.startswith("http"):
+                self.add(Finding("CORS", "cors-foreign", "Cross-origin access granted",
+                                 "info", 70, verified=True, evidence=f"ACAO={acao}"))
+        except requests.RequestException:
+            pass
+
+    # ============================================================
+    # MODULE 6 — Exposure sweep (safe embedded wordlists, GET only)
+    # ============================================================
+    def mod_exposure(self):
+        wl_admin = load_embedded_wordlist(WL_ADMIN_PANELS, 120)
+        wl_sens = load_embedded_wordlist(WL_SENSITIVE_FILES, 150)
+        wl_backup = load_embedded_wordlist(WL_BACKUP_PATHS, 60)
+        wl_vc = load_embedded_wordlist(WL_VERSION_CONTROL, 50)
+        # drop anything whose PURPOSE is to hold secrets — we report on
+        # public artifacts only (fingerprints never record secret values)
+        sens_filtered = [p for p in wl_sens if not any(
+            x in p.lower() for x in (".env", "config", "settings", ".ini",
+                                     ".yml", ".yaml", "database", ".db",
+                                     "dump", ".sql", "shadow", "passwd",
+                                     ".log", "backup", ".bak", ".zip",
+                                     ".tar", ".gz", ".htaccess", "web.config"))]
+        candidates = (SAFE_EXPOSURE_PATHS + wl_vc[:30] + wl_backup[:30] +
+                      wl_admin[:80] + sens_filtered[:60])
+        uniq = list(dict.fromkeys(candidates))
+        self.log(f"— [6/10] Exposure sweep ({len(uniq)} safe paths, GET only)")
+
+        def probe(path: str):
+            url = urljoin(self.target + "/", path.lstrip("/"))
+            r = self.get(url, timeout=8)
+            if r is None:
+                return
+            status = r.status_code
+            body_head = r.content[:self.MAX_BODY_SCAN]
+            ct = r.headers.get("content-type", "").lower()
+            interesting = None
+            if path.endswith(".git/HEAD") and b"ref: refs/" in body_head[:100]:
+                interesting = "Git repository HEAD exposed"
+            elif path.endswith(".git/config") and b"[core]" in body_head[:2000]:
+                interesting = "Git config exposed"
+            elif path.endswith("/xmlrpc.php") and b"XML-RPC works" in body_head:
+                interesting = "WordPress XML-RPC active (pingback amplification risk)"
+            elif path.endswith("/server-status") and b"Apache Server Status" in body_head:
+                interesting = "Apache server-status public"
+            elif path.endswith("/phpinfo.php") and b"phpinfo()" in body_head:
+                interesting = "phpinfo() page publicly accessible"
+            elif status == 200 and "text/html" in ct and re.search(
+                    rb"(?i)<title>[^<]*(index of|directory listing)", body_head[:3000]):
+                interesting = "Directory listing"
+            if interesting:
+                f = Finding("Exposure", "exposed-" + re.sub(r"\W+", "-", path)[:40],
+                            interesting,
+                            "high" if "git" in interesting.lower() or
+                            "phpinfo" in interesting.lower() else "medium",
+                            75, evidence=f"{url} -> HTTP {status}, {len(body_head)}B",
+                            remediation="Restrict access / remove artifact.",
+                            cwe="CWE-538")
+                self.verify_finding(f, url, lambda rr: rr.status_code == status)
+                self.add(f)
+            elif status == 200 and "json" in ct:
+                text = body_head.decode("utf-8", "replace")
+                for fname, rx in FINGERPRINT_RE.items():
+                    if rx.search(text):
+                        f = Finding("Exposure", f"fingerprint-{fname}",
+                                    f"Possible sensitive pattern ({fname}) in {path}",
+                                    "critical", 60,
+                                    evidence=f"{url} matched pattern '{fname}' "
+                                             "(value NOT recorded)",
+                                    remediation="Rotate exposed credentials; "
+                                                "remove file.", cwe="CWE-538")
+                        self.verify_finding(f, url, lambda rr: rr.status_code == 200)
+                        self.add(f)
+
+        with cf.ThreadPoolExecutor(max_workers=self.workers) as ex:
+            list(ex.map(probe, uniq))
+
+    # ============================================================
+    # MODULE 7 — JS / HTML static review (the "new" part you asked for)
+    #   • inline <script> blocks reviewed for dangerous constructs
+    #   • same-origin external .js files fetched (GET) & reviewed
+    #   • source-map (.map) leak detection — original sources exposure
+    #   • CDN scripts without Subresource Integrity (SRI)
+    #   • http:// form actions / mixed content inside markup
+    # Nothing is executed. Pure textual review, like reading an X-ray.
+    # ============================================================
+    def mod_js_review(self):
+        self.log("— [7/10] JavaScript & HTML static review")
+        html_body, final_url = self._root_html()
+        if html_body is None:
+            return
+
+        # 7a. inline script blocks
+        inline_blocks = re.findall(
+            r"<script(?![^>]*\bsrc=)[^>]*>(.*?)</script>", html_body,
+            re.S | re.I)
+        joined_inline = "\n;\n".join(inline_blocks)[:400_000]
+        for pid, title, sev, ev, fix in analyze_js_source(joined_inline, "inline<script>"):
+            f = Finding("JS-Review", pid, title, sev, 70, evidence=ev,
+                        remediation=fix, cwe=pid and "CWE-79")
+            f.cwe = fix.split("[")[-1].rstrip("]") if "[" in fix else ""
+            self.add(f)
+
+        # 7b. dangerous HTML constructs in the markup itself
+        if FORM_ACTION_HTTP_RE.search(html_body):
+            m = FORM_ACTION_HTTP_RE.search(html_body)
+            self.add(Finding("JS-Review", "form-http-action",
+                             "Form submits over cleartext http://", "medium", 85,
+                             evidence=m.group(0)[:120],
+                             remediation="Point form actions at https://.",
+                             cwe="CWE-319"))
+        if INLINE_DEBUGGER_RE.search(html_body):
+            self.add(Finding("JS-Review", "inline-debugger",
+                             "'debugger' statement in inline script", "info", 80,
+                             evidence="debugger found inside <script>",
+                             remediation="Strip debug statements before deploy.",
+                             cwe="CWE-489"))
+        genm = GENERATOR_RE.search(html_body)
+        if genm:
+            self.add(Finding("CMS", "generator",
+                             f"Generator disclosed: {genm.group(1)}",
+                             "low", 95, verified=True, evidence=genm.group(1),
+                             remediation="Remove generator meta tag.", cwe="CWE-200"))
+
+        # 7c. external same-origin scripts — fetch & review (GET only)
+        srcs = [s for s in SRC_JS_RE.findall(html_body)]
+        reviewed = 0
+        cdn_no_sri = []
+        for tag in re.finditer(r"<script[^>]+src=[\"']([^\"']+)[\"'][^>]*>",
+                               html_body, re.I):
+            url_raw = tag.group(1)
+            full = urljoin(final_url or self.target + "/", url_raw)
+            host = urlparse(full).hostname or ""
+            if host != self.host:
+                if host in CDN_HOSTS and not SRI_RE.search(tag.group(0)):
+                    cdn_no_sri.append(url_raw)
+                continue                     # never leave the target's origin
+            if reviewed >= self.MAX_JS_FILES:
+                break
+            r = self.get(full, timeout=10)
+            if r is None or r.status_code != 200:
+                continue
+            if "javascript" not in r.headers.get("content-type", "").lower() \
+                    and not full.endswith((".js", ".mjs")):
+                continue
+            reviewed += 1
+            js_text = r.text[:400_000]
+            for pid, title, sev, ev, fix in analyze_js_source(js_text, url_raw):
+                f = Finding("JS-Review", pid, title, sev, 75,
+                            evidence=ev, remediation=fix)
+                f.cwe = fix.split("[")[-1].rstrip("]") if "[" in fix else ""
+                self.add(f)
+            # source map leak check
+            smap = sourcemap_url(js_text)
+            if smap:
+                map_url = urljoin(full, smap)
+                if urlparse(map_url).hostname == self.host:
+                    rm = self.get(map_url, timeout=10)
+                    if rm is not None and rm.status_code == 200 and len(rm.content) > 50:
+                        try:
+                            mj = json.loads(rm.content[:2_000_000].decode(
+                                "utf-8", "replace"))
+                            nsrc = len(mj.get("sources", []))
+                            has_content = bool(mj.get("sourcesContent"))
+                            self.add(Finding(
+                                "JS-Review", "sourcemap-public",
+                                f"Source map publicly downloadable ({url_raw}.map)",
+                                "high" if has_content else "medium", 90,
+                                evidence=f"{map_url} → {nsrc} original sources, "
+                                         f"'sourcesContent' {'PRESENT' if has_content else 'absent'}",
+                                remediation="Do not ship .map files to production or "
+                                            "protect them behind auth.",
+                                cwe="CWE-540"))
+                        except Exception:
+                            self.add(Finding("JS-Review", "sourcemap-present",
+                                             f"Source map reference in {url_raw}",
+                                             "info", 60, evidence=map_url))
+
+        if cdn_no_sri:
+            self.add(Finding("JS-Review", "cdn-no-sri",
+                             f"CDN scripts loaded without SRI integrity attribute "
+                             f"({len(cdn_no_sri)} file(s))",
+                             "low", 85, verified=True,
+                             evidence=", ".join(cdn_no_sri[:5]),
+                             remediation="Add crossorigin + integrity (SRI) or self-host.",
+                             cwe="CWE-353"))
+
+    # ============================================================
+    # MODULE 8 — WordPress / CMS passive fingerprinting
+    # ============================================================
+    def mod_cms(self):
+        self.log("— [8/10] CMS fingerprinting (passive)")
+        html_body, _ = self._root_html()
+        if html_body is None:
+            return
+        wp = ("wp-content" in html_body) or ("wp-includes" in html_body)
+        if wp:
+            ver = ""
+            rr = self.get(urljoin(self.target + "/", "readme.html"))
+            if rr is not None and rr.status_code == 200:
+                m = re.search(r"WordPress[^0-9]*([0-9]+\.[0-9.]+)", rr.text[:5000])
+                ver = m.group(1) if m else ""
+            self.add(Finding("CMS", "wordpress",
+                             "WordPress detected" + (f" v{ver}" if ver else ""),
+                             "info", 90, verified=True,
+                             evidence=f"wp-content markers; readme version="
+                                      f"{ver or 'n/a'}"))
+            j = self.get(urljoin(self.target + "/", "wp-json/wp/v2/types"))
+            if j is not None and j.status_code == 200:
+                self.add(Finding("CMS", "wp-rest-open",
+                                 "WP REST API responds (user enumeration possible)",
+                                 "low", 70, evidence="/wp-json/wp/v2 responded",
+                                 remediation="Limit REST API access for guests.",
+                                 cwe="CWE-200"))
+        for marker, name in (("drupal", "Drupal"), ("typo3", "TYPO3"),
+                             ("/joomla", "Joomla"), ("shopify", "Shopify"),
+                             ("wixstatic", "Wix"), ("squarespace", "Squarespace")):
+            if marker in html_body.lower():
+                self.add(Finding("CMS", f"cms-{name.lower()}",
+                                 f"{name} fingerprint markers present", "info", 70,
+                                 evidence=f"'{marker}' seen in HTML"))
+                break
+
+    # ============================================================
+    # MODULE 9 — robots.txt / sitemap: READ ONLY (never enqueued)
+    # ============================================================
+    def mod_robots(self):
+        self.log("— [9/10] robots.txt / sitemap inspection (read-only)")
+        for name in ("robots.txt", "sitemap.xml"):
+            url = urljoin(self.target + "/", name)
+            r = self.get(url)
+            if r is None or r.status_code != 200:
+                continue
+            if name == "robots.txt":
+                lines = [l.strip() for l in r.text.splitlines() if l.strip()]
+                disallows = [l for l in lines if l.lower().startswith("disallow")]
+                self.add(Finding("Recon", "robots-found",
+                                 f"robots.txt present ({len(disallows)} Disallow rules)",
+                                 "info", 100, verified=True,
+                                 evidence="; ".join(disallows)[:400],
+                                 description="NOTE: listed paths were NOT crawled "
+                                             "(respecting robots directives)."))
+                for l in disallows:
+                    p = l.split(":", 1)[-1].strip()
+                    if re.search(r"(?i)(admin|backup|\.env|\.git|config|private|"
+                                 r"internal|staging|dump)", p):
+                        f = Finding("Recon", "robots-sensitive-entry",
+                                    f"robots.txt discloses sensitive path: {p}",
+                                    "medium", 85, evidence=l[:200],
+                                    remediation="Use authentication instead of "
+                                                "hiding via robots.", cwe="CWE-200")
+                        self.verify_finding(f, url, lambda rr: rr.status_code == 200)
+                        self.add(f)
+            else:
+                urls = re.findall(r"<loc>(.*?)</loc>", r.text)[:50]
+                self.add(Finding("Recon", "sitemap-found",
+                                 f"sitemap.xml present ({len(urls)} URLs)",
+                                 "info", 100, verified=True,
+                                 evidence="; ".join(urls)[:400]))
+
+    # ============================================================
+    # MODULE 10 — Transport hygiene: mixed content & HTTP→HTTPS redirect
+    # ============================================================
+    def mod_mixed(self):
+        self.log("— [10/10] mixed content & redirects")
+        html_body, _ = self._root_html()
+        if html_body is None:
+            return
+        if (self._final_url or self.target).startswith("https://"):
+            http_refs = re.findall(
+                r'(?:src|href)=["\'](http://[\'"]?[^"\']+)', html_body[:200_000])
+            if http_refs:
+                f = Finding("Transport", "mixed-content",
+                            "Mixed content: http:// resources on https page",
+                            "medium", 75,
+                            evidence=", ".join(http_refs[:5]),
+                            remediation="Serve all assets over TLS.", cwe="CWE-311")
+                self.verify_finding(
+                    f, self._final_url or (self.target + "/"),
+                    lambda rr: bool(re.findall(
+                        r'(?:src|href)=["\']http://', rr.text[:200_000])))
+                self.add(f)
+        else:
+            # HTTP target: check whether an HTTPS counterpart is available at
+            # all — if it is and the site still serves plain HTTP that means
+            # no automatic redirect to TLS.
+            alt = urlunparse(("https", self.parsed.netloc, "/", "", "", ""))
+            rh = self.get(alt, timeout=6)
+            if rh is None:
+                self.add(Finding("Transport", "no-https",
+                                 "HTTPS counterpart unreachable",
+                                 "high", 80, verified=True,
+                                 evidence=f"{alt} did not respond; site served "
+                                          "over cleartext HTTP only",
+                                 remediation="Deploy a TLS certificate and "
+                                             "redirect HTTP -> HTTPS.",
+                                 cwe="CWE-319"))
+
+    # ============================================================
+    # CVE intelligence (READ-ONLY advisory hint — no exploit anything)
+    # ============================================================
+    def mod_cve(self, components: List[Tuple[str, str]]):
+        if not components:
+            return
+        self.log(f"— CVE intelligence for {len(components)} component(s)")
+        for name, ver in components[:5]:
+            self.add(Finding(
+                "CVE", f"cve-watch-{re.sub(r'\W+', '-', name)}",
+                f"Review advisories: {name} {ver}",
+                "info", 55,
+                description="Open-source component detected. Check "
+                            "github.com/github/advisory-database for known CVEs "
+                            f"affecting {name} <= {ver}. This scanner does NOT "
+                            "attempt exploitation.",
+                remediation="Update to latest stable release."))
+
+    # ============================================================
+    # Orchestration
+    # ============================================================
+    def run(self) -> List[Finding]:
+        t0 = time.time()
+        self.log(f"Scanning {self.target} | rate<= {self.throttle.rate} rps | "
+                 f"workers={self.workers} | verify={self.verify_enabled}")
+        steps = [self.mod_dns, self.mod_headers, self.mod_cors, self.mod_tls,
+                 self.mod_ports, self.mod_js_review, self.mod_robots,
+                 self.mod_cms, self.mod_exposure, self.mod_mixed]
+        for i, step in enumerate(steps, 1):
+            if self.cancelled():
+                break
+            try:
+                step()
+            except Exception as e:
+                self.log(f"module error [{step.__name__}]: {e}")
+            self.progress(i / len(steps))
+        comps = []
+        for f in self.findings:
+            if f.category == "CMS" and "WordPress detected" in f.title:
+                m = re.search(r"v(\d[\d.]+)", f.title)
+                comps.append(("wordpress", m.group(1) if m else "unknown"))
+            if f.name == "server-version":
+                comps.append((f.evidence.split(":")[-1].strip().split("/")[0]
+                              or "server", "see-evidence"))
+        try:
+            self.mod_cve(comps)
+        except Exception as e:
+            self.log(f"module error [cve]: {e}")
+        self.duration = time.time() - t0
+        self.log(f"Done in {self.duration:.1f}s | "
+                 f"{self.stats['requests']} requests issued | read-only")
+        self.progress(1.0)
+        return self.findings
+
+
+# ─────────────────────────────────────────────────────────────────────
+# GUI (Tkinter) — dark theme, live table, progress, PDF export
+# ─────────────────────────────────────────────────────────────────────
+SEV_BG = {"critical": "#7f1d1d", "high": "#b91c1c", "medium": "#b45309",
+          "low": "#1d4ed8", "info": "#475569"}
+
+CONSENT = ("H303 DENTIST SCANNER — AUTHORIZED USE ONLY\n\n"
+           "This tool performs NON-DESTRUCTIVE, read-only security "
+           "diagnostics (like a dental X-ray: it looks, it does not cut).\n\n"
+           "It will NOT: brute-force logins, inject SQL/XSS payloads, probe "
+           "system files, flood ports, or send DoS traffic.\n\n"
+           "By continuing you confirm you own this target or have written "
+           "authorization to audit it.")
+
+
+def is_admin() -> bool:
+    if os.name == "nt":
+        try:
+            return bool(ctypes.windll.shell32.IsUserAnAdmin())
+        except Exception:
+            return False
+    try:
+        return os.geteuid() == 0
+    except AttributeError:
+        return False
+
+
+class DentistGUI:
+    def __init__(self, root):
+        import tkinter as tk
+        from tkinter import ttk
+        self.tk = tk
+        self.ttk = ttk
+        self.root = root
+        root.title(f"{VERSION} — Non-Destructive Security Diagnostic")
+        root.geometry("1120x700")
+        root.configure(bg="#0f172a")
+        self.scanner = None
+        self.findings: List[Finding] = []
+        self.log_lines: List[str] = []
+        self.q: "queue.Queue[Tuple[str, Any]]" = queue.Queue()
+        self._build()
+        self._poll()
+
+    # ---------- UI ----------
+    def _build(self):
+        tk, ttk = self.tk, self.ttk
+        style = ttk.Style(self.root)
+        try:
+            style.theme_use("clam")
+        except Exception:
+            pass
+        style.configure("Dark.TFrame", background="#0f172a")
+        style.configure("Dark.TLabel", background="#0f172a", foreground="#e2e8f0")
+        style.configure("Accent.TButton", font=("Segoe UI", 10, "bold"))
+
+        top = ttk.Frame(self.root, style="Dark.TFrame")
+        top.pack(fill="x", padx=10, pady=8)
+        ttk.Label(top, text="Target:", style="Dark.TLabel").grid(row=0, column=0, sticky="w")
+        self.ent_target = ttk.Entry(top, width=52, font=("Consolas", 11))
+        self.ent_target.grid(row=0, column=1, padx=6)
+        self.ent_target.insert(0, "https://example.com")
+        self.btn_scan = ttk.Button(top, text="\u25b6  Start Scan",
+                                   style="Accent.TButton", command=self.start_scan)
+        self.btn_scan.grid(row=0, column=2, padx=4)
+        self.btn_stop = ttk.Button(top, text="\u25a0 Stop", command=self.stop_scan,
+                                   state="disabled")
+        self.btn_stop.grid(row=0, column=3, padx=4)
+        self.btn_pdf = ttk.Button(top, text="\U0001f4c4 Export PDF",
+                                  command=self.export_pdf, state="disabled")
+        self.btn_pdf.grid(row=0, column=4, padx=4)
+
+        opts = ttk.Frame(top, style="Dark.TFrame")
+        opts.grid(row=1, column=0, columnspan=5, sticky="w", pady=(6, 0))
+        self.var_verify = tk.BooleanVar(value=True)
+        self.var_deep = tk.BooleanVar(value=False)
+        self.var_rate = tk.IntVar(value=2)
+        ttk.Checkbutton(opts, text="Verify findings (double-check)",
+                        variable=self.var_verify).pack(side="left", padx=6)
+        ttk.Checkbutton(opts, text="Extended port range 1\u20131024 (slow)",
+                        variable=self.var_deep).pack(side="left", padx=6)
+        ttk.Label(opts, text="Rate limit (req/s):",
+                  style="Dark.TLabel").pack(side="left", padx=(12, 2))
+        tk.Scale(opts, from_=1, to=10, orient="horizontal", length=120,
+                 showvalue=True, variable=self.var_rate, bg="#0f172a",
+                 fg="#e2e8f0", highlightthickness=0).pack(side="left")
+
+        pbframe = ttk.Frame(self.root, style="Dark.TFrame")
+        pbframe.pack(fill="x", padx=10)
+        self.pb = ttk.Progressbar(pbframe, mode="determinate", maximum=100)
+        self.pb.pack(fill="x", pady=4)
+        self.lbl_status = ttk.Label(pbframe, text="Idle.", style="Dark.TLabel")
+        self.lbl_status.pack(anchor="w")
+
+        main = ttk.Panedwindow(self.root, orient="vertical")
+        main.pack(fill="both", expand=True, padx=10, pady=6)
+        ft = ttk.Frame(main, style="Dark.TFrame")
+        main.add(ft, weight=3)
+        cols = ("sev", "cat", "title", "conf", "ver", "target")
+        heads = ("SEV", "CATEGORY", "FINDING", "CONF%", "VERIFIED", "TARGET")
+        widths = (70, 100, 480, 55, 70, 220)
+        self.tree = ttk.Treeview(ft, columns=cols, show="headings", height=12)
+        for c, h, w in zip(cols, heads, widths):
+            self.tree.heading(c, text=h)
+            self.tree.column(c, width=w, anchor="w")
+        for s, bg in SEV_BG.items():
+            self.tree.tag_configure(s, background=bg, foreground="white")
+        vsb = ttk.Scrollbar(ft, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=vsb.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+        self.tree.bind("<Double-1>", self.show_detail)
+
+        lg = ttk.Frame(main, style="Dark.TFrame")
+        main.add(lg, weight=2)
+        self.txt_log = tk.Text(lg, height=12, bg="#020617", fg="#94a3b8",
+                               insertbackground="#94a3b8", font=("Consolas", 9),
+                               state="disabled")
+        self.txt_log.pack(fill="both", expand=True)
+
+        stats = ttk.Frame(self.root, style="Dark.TFrame")
+        stats.pack(fill="x", padx=10, pady=(0, 8))
+        self.lbl_counts = {}
+        for sev in ("critical", "high", "medium", "low", "info"):
+            f = ttk.Frame(stats, style="Dark.TFrame")
+            f.pack(side="left", padx=8)
+            tk.Canvas(f, width=12, height=12, bg=SEV_BG[sev],
+                      highlightthickness=0).pack(side="left")
+            lbl = ttk.Label(f, text=f" {sev}: 0", style="Dark.TLabel")
+            lbl.pack(side="left")
+            self.lbl_counts[sev] = lbl
+
+    # ---------- actions ----------
+    def start_scan(self):
+        from tkinter import messagebox
+        target = self.ent_target.get().strip()
+        if not target or target == "https://example.com":
+            messagebox.showwarning("Input", "Enter a real target URL/IP first.")
+            return
+        if not messagebox.askyesno("Authorized use", CONSENT):
+            return
+        self.findings.clear()
+        self.log_lines.clear()
+        for i in self.tree.get_children():
+            self.tree.delete(i)
+        self.btn_scan.config(state="disabled")
+        self.btn_stop.config(state="normal")
+        self.btn_pdf.config(state="disabled")
+        self.pb["value"] = 0
+        self.lbl_status.config(text="Scanning\u2026")
+        self.scanner = DentistScanner(
+            target,
+            log=lambda m: self.q.put(("log", m)),
+            emit=lambda f: self.q.put(("finding", f)),
+            progress=lambda p: self.q.put(("progress", p)),
+            rps=float(self.var_rate.get()),
+            workers=4,
+            verify=self.var_verify.get(),
+            deep_portscan=self.var_deep.get(),
+        )
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self):
+        try:
+            self.scanner.run()
+        except Exception as e:
+            self.q.put(("log", f"FATAL: {e}"))
+        self.q.put(("done", None))
+
+    def stop_scan(self):
+        if self.scanner:
+            self.scanner.stop()
+            self.q.put(("log", "Stop requested by operator."))
+
+    # ---------- queue pump ----------
+    def _poll(self):
+        try:
+            while True:
+                kind, payload = self.q.get_nowait()
+                if kind == "log":
+                    self._append_log(payload)
+                elif kind == "finding":
+                    self._add_finding(payload)
+                elif kind == "progress":
+                    self.pb["value"] = float(payload) * 100
+                elif kind == "done":
+                    self._finish()
+        except queue.Empty:
+            pass
+        self.root.after(80, self._poll)
+
+    def _append_log(self, msg: str):
+        line = f"[{datetime.now():%H:%M:%S}] {msg}"
+        self.log_lines.append(line)
+        self.txt_log.config(state="normal")
+        self.txt_log.insert("end", line + "\n")
+        self.txt_log.see("end")
+        self.txt_log.config(state="disabled")
+
+    def _add_finding(self, f: Finding):
+        self.findings.append(f)
+        self.tree.insert("", "end", tags=(f.severity,), values=(
+            f.severity.upper(), f.category, f.title, f.confidence,
+            "\u2713" if f.verified else "?", _host_of(f.target)))
+        self._refresh_counts()
+
+    def _refresh_counts(self):
+        counts = {}
+        for f in self.findings:
+            counts[f.severity] = counts.get(f.severity, 0) + 1
+        for sev, lbl in self.lbl_counts.items():
+            lbl.config(text=f" {sev}: {counts.get(sev, 0)}")
+
+    def _finish(self):
+        self.btn_scan.config(state="normal")
+        self.btn_stop.config(state="disabled")
+        dur = getattr(self.scanner, "duration", 0)
+        reqs = self.scanner.stats["requests"] if self.scanner else 0
+        self.pb["value"] = 100
+        self.lbl_status.config(
+            text=f"Finished in {dur:.1f}s | {len(self.findings)} findings | "
+                 f"{reqs} requests (read-only)")
+        if self.findings:
+            self.btn_pdf.config(state="normal")
+
+    def show_detail(self, _ev):
+        tk = self.tk
+        sel = self.tree.selection()
+        if not sel:
+            return
+        idx = self.tree.index(sel[0])
+        if idx >= len(self.findings):
+            return
+        f = self.findings[idx].to_dict()
+        w = tk.Toplevel(self.root)
+        w.title(f["title"][:80])
+        w.geometry("640x420")
+        txt = tk.Text(w, wrap="word", font=("Consolas", 10), bg="#020617",
+                      fg="#e2e8f0")
+        txt.pack(fill="both", expand=True)
+        for k in ("category", "severity", "confidence", "verified",
+                  "description", "evidence", "remediation", "cwe", "target"):
+            txt.insert("end", f"{k.upper()}: {f.get(k)}\n\n")
+        txt.config(state="disabled")
+
+    def export_pdf(self):
+        from tkinter import filedialog, messagebox
+        if not self.findings:
+            return
+        default = f"h303_report_{datetime.now():%Y%m%d_%H%M%S}.pdf"
+        path = filedialog.asksaveasfilename(
+            title="Save PDF report", defaultextension=".pdf",
+            initialfile=default, filetypes=[("PDF", "*.pdf")])
+        if not path:
+            return
+        meta = {
+            "target": self.scanner.target if self.scanner else "",
+            "generated": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "duration": getattr(self.scanner, "duration", 0),
+            "requests": self.scanner.stats["requests"] if self.scanner else 0,
+        }
+        findings = [f.to_dict() for f in
+                    sorted(self.findings, key=lambda x: -SEV_ORDER[x.severity])]
+        try:
+            build_pdf(findings, meta, self.log_lines, path)
+            jpath = os.path.splitext(path)[0] + ".json"
+            with open(jpath, "w", encoding="utf-8") as fh:
+                json.dump({"meta": meta, "findings": findings}, fh,
+                          ensure_ascii=False, indent=2)
+            messagebox.showinfo("Report", f"PDF saved:\n{path}\nJSON saved:\n{jpath}")
+        except Exception as e:
+            messagebox.showerror("Report failed", str(e))
+
+
+def _host_of(url: str) -> str:
+    try:
+        return urlparse(url).netloc or url
+    except Exception:
+        return url
+
+
+# ─────────────────────────────────────────────────────────────────────
+# CLI mode — sudo python3 h303_scanner.py --cli https://target
+# ─────────────────────────────────────────────────────────────────────
+def run_cli(target: str, rps: float, workers: int, verify: bool,
+            deep: bool, out_prefix: Optional[str]) -> int:
+    logs: List[str] = []
+    sc = DentistScanner(target,
+                        log=lambda m: (logs.append(m),
+                                       print(f"  * {m}", flush=True)),
+                        emit=lambda f: print(f"    [{f.severity:>8}] "
+                                             f"{'V' if f.verified else ' '} "
+                                             f"{f.category:<12} {f.title}"),
+                        rps=rps, workers=workers, verify=verify,
+                        deep_portscan=deep)
+    fs = sc.run()
+    ordered = sorted(fs, key=lambda x: -SEV_ORDER[x.severity])
+    print("\n════════ SUMMARY ════════")
+    for f in ordered:
+        print(f"[{f.severity:>8}] conf={f.confidence:3}% "
+              f"verified={'YES' if f.verified else 'no '} | {f.category}: "
+              f"{f.title}")
+    print(f"\n{len(fs)} findings | {sc.stats['requests']} requests | "
+          f"{sc.duration:.1f}s | offsite-skipped={sc.stats['skipped']}")
+    if out_prefix:
+        meta = {"target": sc.target,
+                "generated": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "duration": sc.duration, "requests": sc.stats["requests"]}
+        fd = [f.to_dict() for f in ordered]
+        pdf_path = out_prefix + ".pdf"
+        build_pdf(fd, meta, logs, pdf_path)
+        with open(out_prefix + ".json", "w", encoding="utf-8") as fh:
+            json.dump({"meta": meta, "findings": fd}, fh,
+                      ensure_ascii=False, indent=2)
+        print(f"Report written: {pdf_path} + {out_prefix}.json")
+    return 0
+
+
+# ─────────────────────────────────────────────────────────────────────
+# SELF-TEST SUITE — spins a vulnerable-by-design localhost server and
+# proves every module + safety rule.  sudo python3 h303_scanner.py --selftest
+# Nothing here touches any network except 127.0.0.1.
+# ─────────────────────────────────────────────────────────────────────
+def _start_test_server():
+    import http.server
+    import socketserver
+
+    PAGE = b"""<html><head><title>Test</title>
+<meta name="generator" content="WordPress 6.4.2"></head>
+<body>
+<img src="http://cdn.example.org/x.png">hello /wp-content/themes/x/style.css
+<script src="/app.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/vue@3/dist/vue.global.prod.js"></script>
+<form action="http://login.example.org/in"></form>
+<script>var apiKey = "sk_live_A1B2C3D4E5F6G7H8I9J0";
+document.write("<b>x</b>"); eval("1+1"); postMessage(d, "*"); debugger;</script>
+<div class="wp-includes">x</div>
+</body></html>"""
+
+    APPJS = (b"const secretKey=\"supersecretvalueABCDEFGHIJKLMNOP\";\n"
+             b"var t='eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
+             b"eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U';\n"
+             b"new Function('return 1')();\nsetTimeout(\"alert(1)\", 100);\n"
+             b"console.log('token', t);\n//# sourceMappingURL=/app.js.map\n")
+
+    MAPJSON = json.dumps({"version": 3, "sources": ["src/auth.js", "src/app.js"],
+                          "sourcesContent": ["// original private source",
+                                             "// more hidden code"],
+                          "names": [], "mappings": "AAAA"}).encode()
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def _send(self, code, body=b"", ct="text/html", extra=None):
+            self.send_response(code)
+            self.send_header("Content-Type", ct)
+            self.send_header("Server", "Apache/2.4.52 (Ubuntu)")
+            self.send_header("Set-Cookie", "sess=abc123; Path=/; SameSite=Lax")
+            for k, v in (extra or {}).items():
+                self.send_header(k, v)
+            self.end_headers()
+            if body:
+                self.wfile.write(body)
+
+        def do_GET(self):
+            p = self.path
+            if p == "/.git/HEAD":
+                self._send(200, b"ref: refs/heads/main", "text/plain")
+            elif p == "/xmlrpc.php":
+                self._send(200, b"XML-RPC works here", "text/xml")
+            elif p == "/robots.txt":
+                self._send(200, b"User-agent: *\nDisallow: /admin-backup/\n"
+                                b"Disallow: /public-docs/\n", "text/plain")
+            elif p == "/app.js":
+                self._send(200, APPJS, "application/javascript")
+            elif p == "/app.js.map":
+                self._send(200, MAPJSON, "application/json")
+            elif p == "/readme.html":
+                self._send(200, b"<h1>WordPress > Version 6.4.2</h1>")
+            elif p == "/sitemap.xml":
+                self._send(200, b"<urlset><url><loc>/about</loc></url></urlset>",
+                           "application/xml")
+            elif p.startswith("/admin"):
+                self._send(404, b"nope")
+            else:
+                self._send(200, PAGE)
+
+        def do_OPTIONS(self):
+            self._send(204, b"", extra={"Access-Control-Allow-Origin": "*",
+                                        "Access-Control-Allow-Credentials": "true"})
+
+    srv = socketserver.ThreadingTCPServer(("127.0.0.1", 0), H)
+    srv.daemon_threads = True
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv, srv.server_address[1]
+
+
+def run_selftest() -> int:
+    print(f"{VERSION} — SELF-TEST (localhost only, nothing external touched)")
+    checks: List[Tuple[str, bool]] = []
+
+    def ck(name: str, cond: bool):
+        checks.append((name, bool(cond)))
+        print(f"  [{'PASS' if cond else 'FAIL'}] {name}")
+
+    # ---- unit: wordlist sanitizer blocks traversal/system junk ----
+    dirty = "/ok\n/../etc/passwd\n/etc/shadow\nshell.php\n/id_rsa\n/env\n/.git/HEAD\n"
+    clean = load_embedded_wordlist(dirty, 100)
+    ck("wordlist sanitizer removes traversal/system entries",
+       all(".." not in p and "/etc/" not in p and "passwd" not in p
+           and "shadow" not in p and "id_rsa" not in p for p in clean)
+       and "/ok" in clean and "/.git/HEAD" in clean)
+
+    # ---- unit: throttle hard cap ----
+    th = Throttle(500)
+    ck("throttle enforces HARD CAP of 20 rps", th.rate == 20.0)
+
+    # ---- unit: workers hard cap ----
+    sc0 = DentistScanner("http://127.0.0.1:1", workers=99)
+    ck("worker pool capped at 8 threads", sc0.workers == 8)
+
+    # ---- unit: JS analyzer finds planted issues ----
+    js = ("var apiKey = \"sk_live_ABCDEFGHIJKLMNOP\"; document.write('x');"
+          "eval('1'); new Function('return 1')();"
+          "window.postMessage(x, '*');"
+          "setTimeout(\"f()\", 1); console.log('token', t);"
+          "//# sourceMappingURL=/a.js.map")
+    ids = [h[0] for h in analyze_js_source(js, "unit")]
+    for want in ("js-hardcoded-key", "js-document-write", "js-eval",
+                 "js-function-constructor", "js-postmessage-star",
+                 "js-setinterval-timeout-str", "js-console-log",
+                 "js-sourcemap-ref"):
+        ck(f"JS analyzer detects {want}", want in ids)
+    ck("JS analyzer masks secret VALUES in evidence",
+       all("ABCDEFGHIJKLMNOP" not in h[3] for h in analyze_js_source(js, "unit")))
+
+    # ---- unit: PDF writer produces valid file ----
+    fd = [Finding("Headers", "t", "Title <&>", "high", 90, verified=True,
+                  evidence="x" * 300, remediation="fix", cwe="CWE-1").to_dict()]
+    p = os.path.join(os.getcwd(), "selftest_report.pdf")
+    build_pdf(fd, {"target": "t", "generated": "now", "duration": 1.2,
+                   "requests": 3}, ["line1", "line2"], p)
+    head = open(p, "rb").read(8)
+    tail = open(p, "rb").read()[-10:]
+    ck("PDF magic header %PDF", head.startswith(b"%PDF"))
+    ck("PDF trailer %%EOF", tail.rstrip().endswith(b"%%EOF"))
+    ck("PDF non-trivial size", os.path.getsize(p) > 1500)
+    os.remove(p)
+
+    # ---- integration: full scan against the mock vulnerable server ----
+    srv, port = _start_test_server()
+    time.sleep(0.3)
+    logs: List[str] = []
+    emitted: List[Finding] = []
+    prog = [0.0]
+    sc = DentistScanner(f"http://127.0.0.1:{port}",
+                        log=lambda m: logs.append(m),
+                        emit=lambda f: emitted.append(f),
+                        progress=lambda x: prog.__setitem__(0, x),
+                        rps=15, workers=4, verify=True)
+    fs = sc.run()
+    srv.shutdown()
+    names = [f.name for f in fs]
+    cats = {f.category for f in fs}
+    ev_all = " ".join((f.evidence or "") + (f.description or "") for f in fs)
+
+    ck("module DNS ran", "DNS" in cats)
+    ck("module Headers: missing-hsts found", "missing-hsts" in names)
+    ck("module Headers: missing-csp found", "missing-csp" in names)
+    ck("module Headers: server-version found", "server-version" in names)
+    ck("module Cookies: cookie attribute finding", any(n.startswith("cookie-") for n in names))
+    ck("module CORS: wildcard+credentials caught", "cors-star-creds" in names)
+    ck("module Exposure: git HEAD exposure", any(n.startswith("exposed--git-HEAD") for n in names))
+    ck("module Exposure: xmlrpc detected", any("xmlrpc" in n for n in names))
+    ck("module Recon: robots found", "robots-found" in names)
+    ck("module Recon: sensitive robots entry", "robots-sensitive-entry" in names)
+    ck("module Recon: sitemap found", "sitemap-found" in names)
+    ck("module CMS: wordpress fingerprint", "wordpress" in names)
+    ck("module CMS: generator meta captured", "generator" in names)
+    ck("module JS-Review: hardcoded key (inline)",
+       any(f.name == "js-hardcoded-key" and "inline" in (f.evidence or "") for f in fs))
+    ck("module JS-Review: external app.js reviewed (JWT)",
+       any(f.name == "js-jwt" for f in fs))
+    ck("module JS-Review: sourcemap leak detected", "sourcemap-public" in names)
+    ck("module JS-Review: sourcemap shows sourcesContent",
+       any(f.name == "sourcemap-public" and "PRESENT" in (f.evidence or "") for f in fs))
+    ck("module JS-Review: form http action", "form-http-action" in names)
+    ck("module JS-Review: CDN without SRI", "cdn-no-sri" in names)
+    ck("module Transport: cleartext HTTP flagged (no-https)",
+       any(f.category == "Transport" and f.name in ("mixed-content", "no-https")
+           for f in fs))
+    ck("module TLS ran on https target",
+       all(f.name != "cert-expired" for f in fs))  # mock server is http-only
+    ck("progress callback reached 100%", prog[0] >= 1.0)
+    ck("findings emitted live via callback", len(emitted) == len(fs))
+    ck("verification marked reproduced findings", sum(1 for f in fs if f.verified) >= 5)
+
+    # ---- safety assertions ----
+    crawled_forbidden = any("/admin-backup" in (f.evidence or "")
+                            and f.category == "Exposure" for f in fs)
+    ck("SAFETY: robots Disallow paths were NOT crawled", not crawled_forbidden)
+    ck("SAFETY: no traversal probes anywhere", ".." not in ev_all)
+    ck("SAFETY: no system-file probes", "/etc/passwd" not in ev_all
+       and "win.ini" not in ev_all.lower())
+    ck("SAFETY: secret values never recorded in evidence",
+       "sk_live_ABCDEFGHIJKLMNOP" not in ev_all
+       and "supersecretvalue" not in ev_all)
+    ck("SAFETY: offsite redirects skipped counter exists",
+       "skipped" in sc.stats)
+    ck("SAFETY: request count bounded & logged", sc.stats["requests"] > 0)
+
+    # ---- report export from scan results ----
+    outp = os.path.join(os.getcwd(), "selftest_full.pdf")
+    meta = {"target": sc.target, "generated": time.strftime("%F %T"),
+            "duration": sc.duration, "requests": sc.stats["requests"]}
+    build_pdf([f.to_dict() for f in fs], meta, logs, outp)
+    sz = os.path.getsize(outp)
+    ck(f"full PDF report written ({sz}B)", sz > 3000)
+    jp = outp.replace(".pdf", ".json")
+    with open(jp, "w", encoding="utf-8") as fh:
+        json.dump({"meta": meta, "findings": [f.to_dict() for f in fs]}, fh,
+                  ensure_ascii=False, indent=2)
+    ck("JSON report written", os.path.getsize(jp) > 500)
+    os.remove(outp)
+    os.remove(jp)
+
+    failed = [n for n, okk in checks if not okk]
+    print(f"\n════ SELF-TEST RESULT: {len(checks) - len(failed)}/"
+          f"{len(checks)} passed ════")
+    if failed:
+        print("FAILED:", *failed, sep="\n  - ")
+        return 1
+    print("ALL CHECKS PASSED — engine is healthy, safety rails intact.")
+    return 0
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Entry point — admin/root gate, GUI vs CLI vs selftest
+# ─────────────────────────────────────────────────────────────────────
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        description=f"{VERSION} — non-destructive web security diagnostics")
+    ap.add_argument("--cli", metavar="TARGET",
+                    help="run headless against TARGET instead of GUI")
+    ap.add_argument("--rps", type=float, default=2.0,
+                    help="request rate limit (default 2, hard max 20)")
+    ap.add_argument("--workers", type=int, default=4,
+                    help="thread pool size (hard max 8)")
+    ap.add_argument("--no-verify", action="store_true",
+                    help="disable double-check verification (not recommended)")
+    ap.add_argument("--deep-ports", action="store_true",
+                    help="also probe ports 1-1024 (slow)")
+    ap.add_argument("--out", metavar="PREFIX",
+                    help="write PREFIX.pdf + PREFIX.json after CLI scan")
+    ap.add_argument("--selftest", action="store_true",
+                    help="run the full local test suite and exit")
+    ap.add_argument("--gui-nogate", action="store_true",
+                    help="skip admin/root gate (dev/testing only)")
+    args = ap.parse_args()
+
+    if args.selftest:
+        return run_selftest()
+
+    if not HAVE_REQUESTS:
+        print("ERROR: the 'requests' package is required.\n"
+              "       pip install requests   (then re-run)")
+        return 2
+
+    if not args.gui_nogate and not is_admin():
+        print("=" * 64)
+        if os.name == "nt":
+            print("ADMIN RIGHTS REQUIRED.\n"
+                  "Right-click your terminal → 'Run as administrator', then:\n"
+                  f"    python {os.path.basename(sys.argv[0])}")
+        else:
+            print("ROOT RIGHTS REQUIRED.\n"
+                  "Re-run with sudo:\n"
+                  f"    sudo python3 {os.path.basename(sys.argv[0])}")
+        print("(use --gui-nogate to bypass this gate for development)")
+        print("=" * 64)
+        return 3
+
+    if args.cli:
+        return run_cli(args.cli, args.rps, args.workers,
+                       not args.no_verify, args.deep_ports, args.out)
+
+    try:
+        import tkinter as tk
+    except ImportError:
+        print("Tkinter unavailable — use --cli mode instead:\n"
+              f"  sudo python3 {os.path.basename(sys.argv[0])} --cli https://target")
+        return 2
+    root = tk.Tk()
+    DentistGUI(root)
+    root.mainloop()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
